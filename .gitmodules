@@ -1,3 +1,6 @@
 [submodule "bacterial_microbiome/shared_R_scripts"]
 	path = bacterial_microbiome/shared_R_scripts
 	url = https://github.com/RachelRodgers/shared_R_scripts.git
+[submodule "virome/shared_R_scripts"]
+	path = virome/shared_R_scripts
+	url = https://github.com/RachelRodgers/shared_R_scripts.git
