@@ -27,5 +27,5 @@ Raw sequencing data was processed through VirusSeeker Virome v0.063 (https://wup
 4. Selected subtree
 5. File > Export > BIOM1 Format... > (export taxa at official ranks only?) > No
 6. Saved .biom file
+7. .biom file was used to generate a physeqObject (physeqPhageSelectTaxa.RDS - see TwinMomPhage_Pre-processing.Rmd) that was utilized in the remainder of analyses.
 
-The resulting biom file was utilized in all viral analyses.
