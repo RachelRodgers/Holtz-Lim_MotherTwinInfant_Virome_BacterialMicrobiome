@@ -1,0 +1,371 @@
+---
+title: "Twin Mom 16S Pre-processing"
+author: "Rachel Rodgers"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: html_document
+---
+
+```{r global_options,warning=FALSE, message=FALSE}
+# TwinMom 16S script 3
+
+knitr::opts_chunk$set(warning=FALSE,
+                      message=FALSE)
+```
+
+# Introduction
+
+This script builds the 16S phyloseq objects by combining raw phyloseq with metadata.  This script also removes non-bacterial taxa, low read count samples (< 1000 reads) and buffer-like samples.  Additional contaminating sequences are removed with the decontam prevalence method.  This script writes out two objects:  physeqBacteria (containing true and control samples) and physeqStool (containing true samples only).
+
+```{r load-libraries}
+library("data.table")
+library("tidyverse")
+library("phyloseq")
+library("decontam")
+library("gridExtra")
+library("ggpubr")
+library("ggrepel")
+library("plotly")
+
+source("./shared_R_scripts/Helper_Functions.R")
+source("./TwinMom16S_Shared_Functions.R")
+```
+
+# Generate Phyloseq Objects
+
+The taxonomy within the phyloseq object was assigned using the RDP (Ribosomal Databse Project) database (ps0.rdp_sing.RDS).  
+
+Note that stool samples C013, C015 had no reads after sequencing, and samples C023.2, C045.1, and C010 did not pass the filtering step in dada2.  This brings the total number of 16S samples down from the original number of 100 to 95 in the first phyloseq object that will be generated here.
+
+```{r read-in-merge}
+# Read in sample data and physeq object and merge.
+sampleData <- import_qiime_sample_data("../../data/metadata/TwinMom16S_Metadata_AllSamples.txt")
+physeqRaw <- readRDS("../../data/physeqObjects/ps0.rdp_single.RDS")
+sample_data(physeqRaw) <- sample_data(sampleData)
+
+physeqMerged <- physeqRaw
+physeqMerged
+
+# Remove any missing taxa
+physeqMerged <- RemoveMissingTaxa(physeqMerged)
+physeqMerged 
+CheckPhyloseqObject(physeqMerged)
+```
+
+Re-order levels as needed for DeliveryRoute, FeedingType, and Zygosity.
+
+```{r re-order-factors}
+# Delivery Route - adjust
+levels(sample_data(physeqMerged)$DeliveryRoute)
+sample_data(physeqMerged)$DeliveryRoute <- factor(sample_data(physeqMerged)$DeliveryRoute, 
+                                                   levels = c("Cesarean", "Vaginal", "none"))
+table(sample_data(physeqMerged)$DeliveryRoute)
+
+# FeedingType - OK
+levels(sample_data(physeqMerged)$FeedingType)
+table(sample_data(physeqMerged)$FeedingType)
+
+# Zygosity - OK
+levels(sample_data(physeqMerged)$Zygosity)
+table(sample_data(physeqMerged)$Zygosity)
+
+metadataPhyseqMerged <- data.frame(sample_data(physeqMerged))
+```
+
+# Outlier Filtering
+
+## Sample Filtering by Read Counts
+
+First calculate reads per sample and reads per group.
+
+```{r read-count-distributions}
+# Extract the sample data as a data frame.
+sampleDataTable <- data.frame(sample_data(physeqMerged))
+# Get the sample sums from the physeq object and convert to data frame.
+allReadsPerSample <- sample_sums(physeqMerged)
+allReadsPerSample <- rownames_to_column(as.data.frame(allReadsPerSample), var = "Sample")
+# Bind the sample sums with the sample data.
+allReadsPerSample <- merge(allReadsPerSample, sampleDataTable, 
+                           by = "Sample", all = TRUE)
+
+readsBySample <- dplyr::select(allReadsPerSample,
+                        Sample,
+                        SampleType,
+                        allReadsPerSample)
+
+readsByType <- dplyr::select(allReadsPerSample,
+                      Sample,
+                      allReadsPerSample,
+                      SampleType)
+
+readNumberTable <- readsByType %>% 
+  group_by(SampleType) %>%
+  summarise(TotalReads = sum(allReadsPerSample, rm.na = TRUE))
+readNumberTable
+
+# Re-order the SampleType for readsByType plot
+levels(readsByType$SampleType)
+readsByType$SampleType <- factor(readsByType$SampleType, 
+                                 levels = c("water_control", 
+                                            "cube_buffer_control", 
+                                            "stool_pellet",
+                                            "stool_mother",
+                                            "stool_infant"))
+levels(readsByType$SampleType)
+```
+
+
+Check the number of reads for all samples and just for the stool samples and show which samples have fewer than 1000 total reads:
+
+```{r reads-for-stool-samples, fig.width=9, fig.height=6}
+# All Samples #
+readsByType_boxPlot <- ggplot(readsByType,
+                              aes_string(x = "SampleType",
+                                  y = "allReadsPerSample",
+                                  fill = "SampleType")) +
+  geom_boxplot(outlier.colour = "NA") +
+  scale_y_log10() +
+  geom_hline(yintercept = 1000,
+             lty = 2) +
+  geom_jitter(alpha = 0.5,
+              width = 0.15,
+              size = 2) +
+  geom_text_repel(data = subset(readsByType, allReadsPerSample <= 1000),
+                  aes_string(x = "SampleType", 
+                             y = "allReadsPerSample",
+                             label = "Sample"), size = 3)
+readsByType_boxPlot
+
+# Stool Samples Only #
+readsByType_stool <- filter(readsByType, 
+                            SampleType != "stool_pellet")
+
+readsByType_boxPlot_stool <- ggplot(readsByType_stool,
+                                    aes_string(x = "SampleType",
+                                               y = "allReadsPerSample",
+                                               fill = "SampleType")) +
+  geom_boxplot(outlier.colour = "NA") +
+  scale_y_log10() +
+  geom_hline(yintercept = 1000,
+             lty = 2) +
+  geom_jitter(alpha = 0.5,
+              width = 0.15,
+              size = 2) +
+  geom_text_repel(data = subset(readsByType_stool, allReadsPerSample <= 1000),
+                  aes_string(x = "SampleType", y = "allReadsPerSample",
+                             label = "Sample"),
+                  size = 3)
+readsByType_boxPlot_stool
+```
+
+Now display which samples have fewer than 1000 reads.
+
+```{r lowReadSamples}
+# All #
+lowReadSamples <- filter(readsByType, allReadsPerSample <= 1000)
+lowReadSamples
+```
+
+We'll be removing all samples below 1000 reads, including infant C046.2 (1 read), mother C011 (2 reads), and twin pair C018.1 (311 reads) and C018.2 (535 reads).  I'll be keeping water samples with fewer than 1000 reads for downstream comparisons.
+
+```{r remove-low-samples}
+lowReadTrueSamples <- filter(lowReadSamples,
+                             SampleType == "stool_mother" |
+                             SampleType == "stool_infant")
+
+removeSamples <- as.character(lowReadTrueSamples$Sample)
+
+physeqFiltSamp <- physeqMerged %>%
+  subset_samples(!(Sample %in% removeSamples))
+physeqFiltSamp <- RemoveMissingTaxa(physeqFiltSamp)
+physeqFiltSamp
+```
+
+Total samples have been reduced to 91.
+
+# Taxa Filtering
+
+Here we remove non-bacterial sequences and sequences binned as chloroplasts.  Note that taxa having an NA at the Kingdom or Phylum level are also removed at this step.
+
+```{r physeqBacteria}
+get_taxa_unique(physeqFiltSamp, taxonomic.rank = "Phylum")
+physeqBacteria <- physeqFiltSamp %>%
+  subset_taxa(Kingdom == "Bacteria" &
+              Phylum != "Cyanobacteria/Chloroplast")
+physeqBacteria # 91 samples
+```
+
+```{r save-physeqBacteria}
+physeqBacteria
+saveRDS(physeqBacteria, file = "../../data/physeqObjects/physeqBacteria.RDS")
+```
+
+# Removal of Buffer-like Infant Samples by "norm"-type Confidence Ellipse
+
+Here we determine which samples are indistinguishable from buffer controls and remove.  The strategy is to use a PCoA plot of UniFrac distances and see which true samples fall within the confidence elipse of the buffer controls.
+
+physeqBacteria - 4 low-read samples removed, non-bacterial taxa and chloroplast/cyanobacteria sequences removed.
+Removal of 8 stool_pellet samples will yield 83 samples.
+
+```{r physeqBacteria}
+if (!(exists("physeqBacteria"))) {
+  physeqBacteria <- readRDS("../data/phyloseq_objects/physeqBacteria.RDS")
+}
+
+# Remove stool pellets:
+physeqBacteria <- physeqBacteria %>%
+  subset_samples(SampleType != "stool_pellet") %>%
+  RemoveMissingTaxa()
+physeqBacteria # 83 samples
+```
+
+Plotting ordination of unweighted UniFrac, and using normal confidence ellipses to determine which infant samples are "buffer-like" and should be removed from futher analysis. 
+
+```{r unifracPlot}
+set.seed(787)
+ordUniFrac <- ordinate(physeq = physeqBacteria, 
+                       method = "PCoA", 
+                       distance = "unifrac")
+
+
+unifracPlotEigen <- GetOrdEigenLabs(ordUniFrac)
+
+unifracPlotDF <- plot_ordination(physeq = physeqBacteria,
+                                 ordination = ordUniFrac,
+                                 justDF = TRUE)
+
+unifracPlot <- ggplot(unifracPlotDF,
+                      aes_string(x = "Axis.1", y = "Axis.2",
+                                 shape = "SampleType",
+                                 color = "SampleType",
+                                 label = "Tarr_Subject_ID")) +
+  geom_point(size = 2.5) +
+  ggtitle("PCoA of Unweighted UniFrac Distance") +
+  xlab(unifracPlotEigen[1]) +
+  ylab(unifracPlotEigen[2]) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_manual(values = cbPaletteBlack[c(1, 2, 4, 3)]) +
+  scale_shape_manual(values = c(19, 19, 17, 15)) +
+  stat_ellipse(type = "norm")
+
+ggplotly(unifracPlot, tooltip = c("Tarr_Subject_ID"),
+         height = 550, width = 900)
+
+```
+
+stat_ellipse() type() options include "t", "norm", and "euclid."  "euclid" ellipses are all overlapping and can't be used for our purposes here.  "t" and "norm" are similar, but "norm" clearly incorporates 18 infant samples within the buffer ellipse, while "t" leaves about 3 points right on the edge of the ellipse.  Here I will be using the points as identified by the "norm" ellipse type.
+
+Removing those 18 infant samples:
+
+```{r physeqBacteriaTrim, echo=TRUE}
+discardSamples <- c("C042.2", "C036.1", "C044.1", "C016.2", "C043.2", "C012.2",
+                    "C044.2", "C025.2", "C037.2", "C043.1", "C042.1", "C020.2",
+                    "C013.1", "C019.1", "C020.1", "C011.2", "C021.2", "C016.1")
+
+# Have to use round-about prune_samples instead of subset_taxa because it won't 
+#   work within Shiny R-Markdowns for some reason.
+
+keepSamples <- data.frame(sample_data(physeqBacteria)) %>%
+  filter(!(Tarr_Subject_ID %in% discardSamples))
+
+keepSamples <- as.vector(keepSamples$Sample)
+
+physeqBacteriaTrim <- prune_samples(keepSamples, physeqBacteria) %>%
+  RemoveMissingTaxa()
+
+physeqBacteriaTrim # 65 samples
+```
+
+Re-plotting the unweighted UniFrac PCoA after removal of buffer-like samples:
+
+```{r unifracPlotTrim, fig.width=11, fig.height=8.5}
+set.seed(787)
+ordUniFracTrim <- ordinate(physeq = physeqBacteriaTrim,
+                            method = "PCoA",
+                            distance = "unifrac")
+
+unifracTrimEigen <- GetOrdEigenLabs(ordUniFracTrim)
+
+unifracPlotDFTrim <- plot_ordination(physeq = physeqBacteriaTrim,
+                                      ordination = ordUniFracTrim,
+                                      justDF = TRUE)
+
+unifracPlotTrim <- ggplot(unifracPlotDFTrim,
+                           aes_string(x = "Axis.1", y = "Axis.2",
+                                      shape = "SampleType",
+                                      color = "SampleType",
+                                      label = "Tarr_Subject_ID")) +
+  geom_point(size = 2.5) +
+  ggtitle("PCoA of Unweighted UniFrac Distance") +
+  xlab(unifracTrimEigen[1]) +
+  ylab(unifracTrimEigen[2]) +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  scale_color_manual(values = cbPaletteBlack[c(1, 2, 4, 3)]) +
+  scale_shape_manual(values = c(19, 19, 17, 15)) +
+  stat_ellipse(type = "norm")
+unifracPlotTrim
+
+ggplotly(unifracPlotTrim, tooltip = c("Tarr_Subject_ID"),
+         height = 550, width = 900)
+```
+
+# Decontam at threshold = 0.25
+
+Now we will use the decontam function to remove contaminant sequences from the data set.
+
+```{r metadataMerged}
+# Add total read counts per sample to physeqBacteria sample data
+readsPerSample <- sample_sums(physeqBacteriaTrim)
+readsPerSample <- rownames_to_column(as.data.frame(readsPerSample),
+                                     var = "Sample")
+# Bind the sample sums with the sample data.
+metadataTrimmed <- data.frame(sample_data(physeqBacteriaTrim))
+
+metadataMerged <- merge(readsPerSample,
+                        metadataTrimmed,
+                        by = "Sample")
+metadataMerged <- column_to_rownames(as.data.frame(metadataMerged),
+                                     var = "Sample")
+
+# Bind back with the physeq object
+sample_data(physeqBacteriaTrim) <- sample_data(metadataMerged)
+```
+
+```{r physeqBacteriaNoContam}
+contamDF <- isContaminant(physeqBacteriaTrim,
+                          method = "prevalence",
+                          neg = "IsAControl",
+                          threshold = 0.25)
+  
+# Remove the identified contaminants
+physeqBacteriaNoContam <- prune_taxa(!contamDF$contaminant, physeqBacteriaTrim)
+
+# Remove any samples whose sample_sums have gone to 0 after contam removal
+physeqBacteriaNoContam <- prune_samples(sample_sums(physeqBacteriaNoContam) > 0,
+                                physeqBacteriaNoContam)
+physeqBacteriaNoContam # 64 samples
+```
+
+```{r physeqStool}
+# Subset out just the stool samples
+physeqStool <- physeqBacteriaNoContam %>%
+  subset_samples(IsAControl == FALSE) %>%
+  RemoveMissingTaxa()
+physeqStool #57 samples
+
+metadataStool <- data.frame(sample_data(physeqStool))
+```
+
+```{r save-physeqStool}
+saveRDS(physeqStool, file = "../../data/physeqObjects/physeqStool.RDS")
+```
+
+***
+
+Session Information
+```{r}
+Sys.Date()
+getwd()
+sessionInfo()
+```

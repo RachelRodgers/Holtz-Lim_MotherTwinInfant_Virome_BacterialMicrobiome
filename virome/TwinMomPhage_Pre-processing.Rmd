@@ -1,0 +1,200 @@
+---
+title: "Twin Mom Phage Pre-processing"
+author: "Rachel Rodgers"
+date: "May 8, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+```{r load-libraries, message=FALSE}
+library("here")
+library("phyloseq")
+library("data.table")
+library("tibble")
+library("dplyr")
+library("ggplot2")
+library("ggpubr")
+
+source("./shared_R_scripts/Helper_Functions.R")
+```
+
+# Intro
+
+This markdown file builds the phyloseq objects for twin-mom phage analysis starting with the BIOM1 file generated from MEGAN. An OTU and taxonomy table for the phage data is contained in a BIOM file generated from the "AbsoluteCounts_Comparison.megan" file in MEGAN.  This file was generated as follows:
+
+1.) Opened AbsoluteCounts_Comparison.megan
+2.) Selected Virus node
+3.) Uncollapsed whole subtree beneath selected nodes
+4.) Selected subtree
+5.) File > Export > BIOM1 Format... > (export taxa at official ranks only?) > No
+6.) Saved as /data/comparison_files/AbsoluteCounts_Comparison-Taxonomy_VirusAllRanks.biom
+
+# Read in Data & Construct Phyloseq Object
+
+## Build Phyloseq Object Containing All Taxa
+
+```{r read-in-biom}
+biomData <- import_biom("../../data/comparison_files/AbsoluteCounts_Comparison-Taxonomy_VirusesAllRanks.biom")
+biomData # 2081 taxa x 86 samples & 10 taxonomic ranks
+```
+
+For further analysis, we need to include sample data with the OTU and taxonomy table. 
+
+```{r phageAllTaxa}
+phageMetadata <- readRDS(file = "../../data/metadata/TwinMomPhage_Metadata.RDS")
+
+# Convert to sample_data class and merge with biomData
+physeqAllTaxa <- merge_phyloseq(biomData, sample_data(phageMetadata))
+# Check again:
+physeqAllTaxa
+```
+
+Get some info on the samples in the data set (from the metadata).
+```{r check-samples-numbers}
+table(phageMetadata$SampleType)
+```
+
+## Build Phyloseq Object Containing Only the Selected Viral Groups
+
+MEGAN has identified many viral groups in this data set.  Here I am just selecting those groups that we are most interested in analyzing:
+"Family" level groups we're interested in:
+  *Unclassified Caudovirales
+  *Myoviridae
+  *Siphoviridae
+  *Podoviridae
+  *Unclassified dsDNA phage
+  *Unclassified dsDNA virus
+  *Environmental samples
+  *Inoviridae
+  *Microviridae
+  *Unclassified ssDNA virus
+  *Unclassified bacterial viruses
+  *Unclassified virophages
+  
+The phyloseq object contains numbered ranks.  These "family" groups are scattered across several ranks, so we first need to determine which rank each group is currently sitting at, and use that information to select out these groups of interest.
+
+```{r groupPositions}
+# Check the taxonomy table
+fullTaxTable <- data.table(data.frame(as(tax_table(physeqAllTaxa),
+                                         "matrix")),
+                           keep.rownames = TRUE)
+
+# Create list of names for the groups we're interested in keeping:
+groupNameList <- list("unclassified Caudovirales",
+                      "Myoviridae",
+                      "Siphoviridae",
+                      "Podoviridae",
+                      "unclassified dsDNA phages",
+                      "unclassified dsDNA viruses",
+                      "environmental samples",
+                      "Inoviridae",
+                      "Microviridae",
+                      "unclassified ssDNA viruses",
+                      "unclassified bacterial viruses",
+                      "unclassified virophages")
+
+# For each group, look through the taxonomy table and return the position of 
+#   that group, then get the column where that group is present.
+groupPositions <- list()
+
+for (i in 1:length(groupNameList)) {
+  positionInTable <- which(fullTaxTable == groupNameList[i], arr.ind = T)
+  allColumnPositions <- positionInTable[,2] # col 2 gives column number where the group appears in tax table
+  uniqueColumns <- unique(allColumnPositions) # in case a name appears in multiple rows
+  print(paste(groupNameList[i], "is present in column:", uniqueColumns, sep = " "))
+  groupPositions[[i]] <- colnames(fullTaxTable)[uniqueColumns] # Return the column name, not col # 
+}
+
+# Add the names of the elements
+names(groupPositions) <- groupNameList
+
+# Unlist (change to vector)
+groupPositions <- data.frame(rank = unlist(groupPositions))
+groupPositions <- groupPositions %>% 
+  rownames_to_column(var = "group") %>%
+  arrange(desc(rank))
+groupPositions
+```
+
+We now know what rank each of our groups of interest is assigned in the full taxonomy table.  "environmental samples" are present at several rank levels.  By investigating the tree in MEGAN, it looks like we want "environmental samples" at the least specific rank which is Rank3.
+
+From the original physeq object, we can subset out our taxa of interest (retaining all rank levels).
+```{r physeqSelectTaxa}
+physeqSelectTaxa <- subset_taxa(physeqAllTaxa,
+                                Rank5 == "unclassified Caudovirales" | 
+                                Rank5 == "Myoviridae" | 
+                                Rank5 == "Siphoviridae" |
+                                Rank5 == "Podoviridae" |
+                                Rank4 == "unclassified dsDNA phages" |
+                                Rank4 == "unclassified dsDNA viruses" |
+                                Rank3 == "environmental samples" |
+                                Rank4 == "Inoviridae" |
+                                Rank4 == "Microviridae" |
+                                Rank4 == "unclassified ssDNA viruses" |
+                                Rank3 == "unclassified bacterial viruses" |
+                                Rank3 == "unclassified virophages")
+
+
+# Object checks:
+# Check the rank names to ensure all the ranks remain:
+rank_names(physeqSelectTaxa)
+physeqSelectTaxa
+```
+
+Selecting just these viral groups brings the total number of taxa down to 1,772 from the original 2,081.
+
+Write this object out for Efrem to use for multivariate analysis.
+```{r save-physeqSelectTaxa}
+saveRDS(physeqSelectTaxa,
+        file = "../../data/physeqObjects/physeqPhageSelectTaxa.RDS")
+```
+
+## Build Phyloseq Object Containing Only the "Family" Level Rank of the Selectec Viral Groups
+
+Currently, the selected viral groups above are all at different rank levels.  We want to consider them at equivalent taxonomic rank levels.  In this case, we needed to move unclassified dsDNA phages, Inoviridae, Microviridae, unclassified bacterial viruses, unclassified virophages to the same rank as Sipho, Myo, etc. To do this, export the current taxonomy table from physeqSelectTaxa then manually edit the taxonomy file to shift all our selected groups to the Family rank, and removed everything above and below Family.  In the end there is only one rank for each group.
+
+```{r taxTableSelectTaxa}
+taxTableSelectTaxa <- as.data.frame(tax_table(physeqSelectTaxa))
+write.table(taxTableSelectTaxa,
+            file = "../../data/taxTableSelectTaxa.txt",
+            quote = FALSE, sep = "\t")
+```
+
+To incorporate this edited taxonomy table back into the phyloseq object, we can read the edited taxonomy table into R and overwrite the taxonomy table currently in the physeqSelectTaxa object.
+
+```{r physeqSelectTaxa_famRank}
+editedTaxTable <- read.delim(file = "../../data/editedTaxonomyTable.txt",
+                             row.names = 1, # first column of table is row names
+                             stringsAsFactors = FALSE)
+
+editedTaxMatrix <- as.matrix(editedTaxTable) # correctly maintains row names
+
+# Copy over previous physeq object and overwrite its current tax table
+physeqSelectTaxa_famRank <- physeqSelectTaxa
+tax_table(physeqSelectTaxa_famRank) <- editedTaxMatrix
+
+# Object checks:
+CheckPhyloseqObject(physeqSelectTaxa_famRank, taxRank = "Family")
+physeqSelectTaxa_famRank
+```
+
+Now that the desired phyloseq objects are made we can save them to disk for space management and to avoid confusion.
+
+```{r save-physeq-object}
+saveRDS(physeqAllTaxa, "../../data/physeqObjects/physeqAllTaxa.RDS")
+saveRDS(physeqSelectTaxa, "../../data/physeqObjects/physeqSelectTaxa.RDS")
+saveRDS(physeqSelectTaxa_famRank, "../../data/physeqObjects/physeqSelectTaxa_famRank.RDS")
+```
+
+### Program info
+
+```{r session_information}
+Sys.Date()
+getwd()
+sessionInfo()
+```

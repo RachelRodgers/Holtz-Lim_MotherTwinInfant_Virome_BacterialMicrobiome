@@ -1,0 +1,682 @@
+---
+title: "TwinMom 16S Analysis"
+author: "Rachel Rodgers"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: html_document
+---
+
+```{r global-options, warning=FALSE, message=FALSE, echo=FALSE}
+# TwinMom 16S script 4
+
+knitr::opts_chunk$set(warning=FALSE,
+                      message=FALSE,
+                      cache = T)
+```
+
+```{r load-libraries}
+library("phyloseq")
+library("plotly")
+library("microbiome")
+library("decontam")
+library("ggpubr")
+library("ggrepel")
+library("vegan")
+library("pheatmap")
+library("reshape2")
+library("scales")
+library("data.table")
+library("qpcR")
+library("RColorBrewer")
+library("gridExtra")
+library("DESeq2")
+library("tidyverse")
+
+source("./shared_R_scripts/Helper_Functions.R")
+source("./TwinMom16S_Shared_Functions.R")
+```
+
+# Intro
+
+In this scipt we analyze the diversity of 16S stool samples.
+
+```{r load-physeqStool}
+physeqStool <- readRDS("../../data/physeqObjects/physeqStool.RDS")
+```
+
+# Alpha Diversity Plots
+
+```{r ecoIdxDF, fig.width=9, fig.height=6}
+ecoIdxDF <- global(x = physeqStool, 
+                   index = c("observed", "diversities_shannon"))
+metadataStool <- data.frame(sample_data(physeqStool))
+ecoIdxDF <- merge(metadataStool, ecoIdxDF, by = "row.names")
+
+AlphaBoxPlot <- function(df, 
+                        xVar, 
+                        yVar, 
+                        label_y = NULL, 
+                        label_x = NULL, 
+                        statMethod = NULL) {
+
+  ggplot(data = df, aes_string(x = xVar, y = yVar)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(width = 0.2) +
+    ylab(label_y) +
+    xlab(label_x) +
+    theme_pubr() +
+    theme(axis.title.x = element_blank(),
+          axis.title.y = element_text(size = 20),
+          axis.text.x = element_text(size = 18),
+          axis.text.y = element_text(size = 18)) +
+      stat_compare_means(method = statMethod, label.x.npc = 0.5, size = 5)
+}
+
+# Rename levels of sample type
+levels(ecoIdxDF$SampleType)
+ecoIdxDF$SampleType <- factor(ecoIdxDF$SampleType,
+                              labels = c("Infants", "Mothers"))
+
+richnessPlot <- AlphaBoxPlot(df = ecoIdxDF,
+                            xVar = "SampleType",
+                            yVar = "observed",
+                            label_y = "Richness",
+                            statMethod = "wilcox.test")
+
+diversityPlot <- AlphaBoxPlot(df = ecoIdxDF,
+                             xVar = "SampleType",
+                             yVar = "diversities_shannon",
+                             label_y = "Shannon Diversity",
+                             statMethod = "wilcox.test")
+
+richnessPlot
+diversityPlot
+```
+
+# Community Composition Plots
+
+```{r familyCompPlot, fig.width=11, fig.height=8.5}
+# Calculate abundance data frame at Family rank
+familyAbdDF <- MakeAbundanceDF(physeq = physeqStool,
+                               taxRank = "Family",
+                               abundanceFilter = 0)
+
+# Order infant and mother samples by Tarr ID
+metadataStool <- metadataStool %>%
+  rownames_to_column(var = "Sample") %>%
+  arrange(InfantMother, Tarr_Subject_ID)
+
+sampleLevels <- as.character(metadataStool$Sample)
+
+sampleLabels <- metadataStool %>%
+  dplyr::select(Sample, Tarr_Subject_ID, InfantMother)
+
+sampleLabels$InfantMother <- factor(sampleLabels$InfantMother,
+                                    labels = c("I", "M"))
+
+sampleLabels <- sampleLabels %>%
+  mutate("ID" = paste0(InfantMother, Tarr_Subject_ID))
+
+sampleLabelsVec <- sampleLabels$ID
+names(sampleLabelsVec) <- sampleLabels$Sample
+
+# Order the samples in familyAbdDF by the sampleLevels
+familyAbdDF$Sample <- factor(familyAbdDF$Sample, levels = sampleLevels)
+
+familyCompPlot <- ggplot(familyAbdDF,
+                         aes_string(x = "Sample", y = "Abundance",
+                                    fill = "Family")) +
+  geom_bar(stat = "identity", width = 1) +
+  theme_bw() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 90)) +
+  scale_x_discrete(labels = sampleLabelsVec)
+familyCompPlot
+```
+
+# Pairwise Distance Boxplots Using Unweighted and Weighted UniFrac
+
+Generate unweighted UniFrac pairwise distance data frame:
+
+```{r unweightedDistDF}
+set.seed(787)
+
+# Calculate the distance object
+unweightedDist <- UniFrac(physeqStool, weighted = FALSE)
+
+# Coerce distance object into matrix
+unweightedDistMtx <- as.matrix(unweightedDist)
+
+# Melt and remove values of 0 to eliminate distances of each sample to itself
+unweightedDistMtx_melt <- subset(reshape2::melt(unweightedDistMtx, 
+                                                value.name = "UniFrac_Distance"),
+                                 UniFrac_Distance != 0)
+
+# Change Var1 and Var2 from factors to characters for easier use with dplyr
+factorCols <- c("Var1", "Var2")
+unweightedDistMtx_melt[factorCols] <- lapply(unweightedDistMtx_melt[factorCols], 
+                                             as.character)
+
+# Add columns for later subsetting when plotting.  This information will get
+#   pulled from the metadata (metadataStool).  Within the *DistMtx_melt data 
+#   frames, we need a column indicating whether Var1 and Var2 are infants,
+#   mothers, and whether they're related.
+unweightedDistDF <- unweightedDistMtx_melt
+
+# Add Var1 and Var2 Type and Zygosity columns
+# Put rownames back in metadataStool, then use the rownames to locate needed info
+metadataStool <- column_to_rownames(metadataStool, var = "Sample")
+
+unweightedDistDF <- unweightedDistDF %>%
+  mutate(Var1_Type = metadataStool[unweightedDistDF$Var1, "InfantMother"],
+         Var2_Type = metadataStool[unweightedDistDF$Var2, "InfantMother"])
+
+# To easily determine the relatedness of the paired samples in each row,
+#   create "short names" to replace the long sample names.
+#   First put the rownames back into a column.
+
+metadataStool <- rownames_to_column(metadataStool, var = "Sample")
+
+lut_df <- dplyr::select(metadataStool, Sample, InfantMother, Tarr_Subject_ID) %>%
+  mutate(uniqueID = paste(InfantMother, Tarr_Subject_ID, sep = ".")) %>%
+  dplyr::select(Sample, uniqueID)
+
+# convert lut_df into a vector
+lut <- as.character(lut_df$uniqueID)
+names(lut) <- lut_df$Sample
+
+# Add in the short names to the distance data frames
+unweightedDistDF$Var1_ShortName <- lut[unweightedDistDF$Var1]
+unweightedDistDF$Var2_ShortName <- lut[unweightedDistDF$Var2]
+
+# Add a column indicating whether a given row (pairwise comparison) is between
+#   two related or unrelated samples.
+#   Loop over the rows of the distance df, split Var1 and Var2 short names by 
+#   "." delimiter and compare the 2nd element of the resulting list which will hold the 
+#   Tarr Family ID,
+
+AddPairRelation <- function(df) {
+  
+  oldDF <- df
+  
+  pairRelation <- vector(mode = "character", length = nrow(oldDF))
+  
+  for (i in 1:nrow(oldDF)) {
+    Var1_split <- strsplit(x = df[i, "Var1_ShortName"], split = "\\.")
+    Var2_split <- strsplit(x = df[i, "Var2_ShortName"], split = "\\.")
+    
+    if (Var1_split[[1]][[2]] == Var2_split[[1]][[2]]) {
+      pairRelation[i] <- "related"
+      } else {
+        pairRelation[i] <- "unrelated"
+      }
+  }
+  
+  oldDF$Pair_Relation <- pairRelation
+  
+  return(oldDF)
+
+}
+
+unweightedDistDF <- AddPairRelation(unweightedDistDF)
+```
+
+Generate weighted UniFrac pairwise distance data frame:
+
+```{r weightedDistDF}
+# Repeat the same process for unweightedDistDF to create weightedDistDF
+set.seed(787)
+
+# Calculate weighted distance, melt and convert to df
+weightedDist <- UniFrac(physeqStool, weighted = TRUE)
+
+weightedDistMtx <- as.matrix(weightedDist)
+
+weightedDistMtx_melt <- subset(reshape2::melt(weightedDistMtx,
+                                              value.name = "WUniFrac_Distance"),
+                               WUniFrac_Distance != 0)
+
+weightedDistMtx_melt[factorCols] <- lapply(weightedDistMtx_melt[factorCols],
+                                           as.character)
+
+weightedDistDF <- weightedDistMtx_melt
+
+# Add type and short names
+metadataStool <- column_to_rownames(metadataStool, var = "Sample")
+
+weightedDistDF <- weightedDistDF %>%
+  mutate(Var1_Type = metadataStool[weightedDistDF$Var1, "InfantMother"],
+         Var2_Type = metadataStool[weightedDistDF$Var2, "InfantMother"])
+
+weightedDistDF$Var1_ShortName <- lut[weightedDistDF$Var1]
+weightedDistDF$Var2_ShortName <- lut[weightedDistDF$Var2]
+
+# Add pairwise relationships
+weightedDistDF <- AddPairRelation(weightedDistDF)
+```
+
+## UniFrac Distances of Related and Unrelated Infants
+
+```{r infantPairwiseBoxPlots, fig.width=9, fig.height=6}
+
+PlotInfantDistances <- function(df, distanceVar, distanceLabel, statTest) {
+  
+  infantDF <- df %>%
+    filter(Var1_Type == "infant" & Var2_Type == "infant")
+  
+  infantDFNoDupes <- infantDF[!duplicated(infantDF[distanceVar]), ]
+  
+  boxPlot <- MakeBoxPlot(df = infantDFNoDupes,
+                         xVar = "Pair_Relation",
+                         yVar = distanceVar,
+                         label_y = distanceLabel,
+                         statMethod = statTest)
+}
+
+infantPairwiseDistanceBoxPlots <- pmap(.l = list(df = list(unweighted = unweightedDistDF,
+                                                           weighted = weightedDistDF),
+                                                 distanceVar = list(unweighted = "UniFrac_Distance",
+                                                                    weighted = "WUniFrac_Distance"),
+                                                 distanceLabel = list(unweighted = "UniFrac Distance",
+                                                                      weighted = "Weighted UniFrac Distance")),
+                                       .f = PlotInfantDistances,
+                                       statTest = "wilcox.test")
+infantPairwiseDistanceBoxPlots
+```
+
+## UniFrac Distances of Related and Unrelated Infants and Mothers
+
+```{r momInfPairwiseDistBoxPlots, fig.width=9, fig.height=6}
+PlotMotherInfantDistances <- function(df, distanceVar, distanceLabel, statTest) {
+  
+  momAndInfDF <- df %>%
+    filter(Var1_Type == "infant" & Var2_Type == "mother" |
+           Var1_Type == "mother" & Var2_Type == "infant")
+  
+  momAndInfDFNoDupes <- momAndInfDF[!duplicated(momAndInfDF[distanceVar]), ]
+  
+  boxPlot <- MakeBoxPlot(df = momAndInfDFNoDupes,
+                         xVar = "Pair_Relation",
+                         yVar = distanceVar,
+                         label_y = distanceLabel,
+                         statMethod = statTest)
+}
+
+momInfPairwiseDistBoxPlots <- pmap(.l = list(df = list(unweighted = unweightedDistDF,
+                                           weighted = weightedDistDF),
+                                 distanceVar = list(unweighted = "UniFrac_Distance",
+                                                    weighted = "WUniFrac_Distance"),
+                                 distanceLabel = list(unweighted = "UniFrac Distance",
+                                                      weighted = "Weighted UniFrac Distance")),
+                       .f = PlotMotherInfantDistances,
+                       statTest = "wilcox.test")
+momInfPairwiseDistBoxPlots
+```
+
+```{r pairwise-dist-all-v-all}
+# This plot needs to have three categories: all infants to all infants,
+#   all mothers to all mothers, and all infants to all mothers.
+
+# Remove duplicates from weightedDistDF, then subset.
+#   Add a category column to indicate which group the subsets belong in then
+#   bind back together for plotting.
+
+# Remove Duplicates
+weightedDistDFNoDupes <- weightedDistDF[!duplicated(weightedDistDF["WUniFrac_Distance"]), ]
+
+# Add category columns 
+weightedDistDFNoDupes <- weightedDistDFNoDupes %>%
+  mutate(category = case_when(Var1_Type == "infant" & Var2_Type == "infant" ~ "Within Infants",
+                              Var1_Type == "mother" & Var2_Type == "mother" ~ "Within Mothers",
+                              TRUE ~ "Infants vs Mothers")) # if ELSE is TRUE?
+
+```
+
+```{r check-all-v-all-plot, fig.width=9, fig.height=6}
+all_all_boxPlot <- MakeBoxPlot(df = weightedDistDFNoDupes,
+                               xVar = "category",
+                               yVar = "WUniFrac_Distance",
+                               label_y = "Weighted UniFrac Distance",
+                               statMethod = "kruskal.test")
+all_all_boxPlot
+```
+
+```{r withinInfMoms, fig.width=9, fig.height=6}
+# Check just the w/n infants vs w/n mothers
+withinInfvMoms <- filter(weightedDistDFNoDupes,
+                         category != "Infants vs Mothers")
+
+withinInfvMomsPlot <- MakeBoxPlot(df = withinInfvMoms,
+                                  xVar = "category",
+                                  yVar = "WUniFrac_Distance",
+                                  label_y = "Weighted UniFrac Distance",
+                                  statMethod = "wilcox.test")
+withinInfvMomsPlot
+```
+
+## Weighted UniFrac Distances between Mothers and Infants for C-section vs. Vaginal Deliveries (Related Pairs)
+
+```{r dist-dlv-route, fig.width=9, fig.height=6}
+# starting with weightedDistDFNoDupes
+weightedDistRoute <- weightedDistDFNoDupes %>%
+  filter(category == "Infants vs Mothers" & Pair_Relation == "related")
+
+# In this case, Var1_Type is always infant and Var2_Type is always mother
+#   so we can easily loop over the values for Var1 and look up the delivery route
+
+metadataStool$DeliveryRoute <- as.character(metadataStool$DeliveryRoute)
+
+weightedDistRoute <- weightedDistRoute %>%
+  mutate("DeliveryRoute" = metadataStool[Var1, "DeliveryRoute"])
+
+weightedPairwiseDistRoute <- MakeBoxPlot(df = weightedDistRoute,
+                                         xVar = "DeliveryRoute",
+                                         yVar = "WUniFrac_Distance",
+                                         label_y = "Weighted UniFrac Distance",
+                                         statMethod = "wilcox.test")
+weightedPairwiseDistRoute
+
+# Format this data frame for Prism
+cSectionCol <- weightedDistRoute %>%
+  filter(DeliveryRoute == "Cesarean") %>%
+  dplyr::select(WUniFrac_Distance)
+cSectionCol <- as.vector(cSectionCol$WUniFrac_Distance) # length = 12
+
+vaginalCol <- weightedDistRoute %>%
+  filter(DeliveryRoute == "Vaginal") %>%
+  dplyr::select(WUniFrac_Distance)
+vaginalCol <- as.vector(vaginalCol$WUniFrac_Distance) # length = 15
+
+wUniFracDeliveryRoute = cbind("C-section" = c(cSectionCol,
+                                              rep(NA,
+                                                  length(vaginalCol) -
+                                                    length(cSectionCol))),
+                              "Vaginal" = cSectionCol)
+```
+
+## Weighted UniFrac Distances between Related Infants for Monozygotic vs. Dizygotic (related pairs)
+
+```{r dist-zygosity, fig.width=9, fig.height=6}
+weightedDistZygosity <- weightedDistDFNoDupes %>%
+  filter(category == "Within Infants" & Pair_Relation == "related")
+
+# Can simply used Var1 to look up the zygosity for the twin pair
+metadataStool$Zygosity <- as.character(metadataStool$Zygosity)
+
+weightedDistZygosity <- weightedDistZygosity %>%
+  mutate("Zygosity" = metadataStool[Var1, "Zygosity"])
+
+weightedPairwiseDistZygosity <- MakeBoxPlot(df = weightedDistZygosity,
+                                            xVar = "Zygosity",
+                                            yVar = "WUniFrac_Distance",
+                                            label_y = "Weighted UniFrac Distance",
+                                            statMethod = "wilcox.test")
+weightedPairwiseDistZygosity
+
+# Format this data frame for Prism
+monozygoticColumn <- weightedDistZygosity %>%
+  filter(Zygosity == "Monozygotic") %>%
+  dplyr::select(WUniFrac_Distance)
+monozygoticColumn <- as.vector(monozygoticColumn$WUniFrac_Distance) # length = 4
+
+dizygoticColumn <- weightedDistZygosity %>%
+  filter(Zygosity == "Dizygotic") %>%
+  dplyr::select(WUniFrac_Distance)
+dizygoticColumn <- as.vector(dizygoticColumn$WUniFrac_Distance) # length = 7
+
+wUniFracZygosity = cbind("Monozygotic" = c(monozygoticColumn,
+                                           rep(NA,
+                                               length(dizygoticColumn) -
+                                                 length(monozygoticColumn))),
+                         "Dizygotic" = dizygoticColumn)
+```
+
+# Determine which samples belong to "Complete Families" - family groups having one mother and at least one infant
+
+```{r find-complete-families}
+# First determine which family groups have at least one mother and one infant sample.
+
+metadataStool$InfantMother <- as.character(metadataStool$InfantMother)
+
+allFamilyGroups <- as.character(unique(metadataStool$Family_Group))
+
+keepFamilyGroupList <- list()
+
+# loop over family groups and count how many moms and infants each group has
+for (i in 1:length(allFamilyGroups)) {
+  
+  currentFamilyGroup <- allFamilyGroups[i]
+  momCount <- 0
+  infantCount <- 0
+  keepFamilyGroup <- FALSE
+  
+  for (row in 1:nrow(metadataStool)) {
+    if (metadataStool[row, "Family_Group"] == currentFamilyGroup) {
+      if(metadataStool[row, "InfantMother"] == "mother") {
+        momCount <- momCount + 1
+        } else {
+          infantCount <- infantCount + 1
+      }
+    }
+    if (momCount > 0 & infantCount > 0) {
+      keepFamilyGroup <- TRUE
+    }
+    keepFamilyGroupList[[currentFamilyGroup]] <- keepFamilyGroup
+  }
+}
+
+keepFamilyGroupList <- unlist(keepFamilyGroupList)
+keepFamilies <- names(keepFamilyGroupList[keepFamilyGroupList == TRUE])
+
+# 10 families are incomplete.  Of these, families 11 and 13 are one infant, and
+#   10 and 15 is two infants, removing 6 more infants from the data set for a 
+#   total of 33 - 6 = 27
+
+# Subset physeqStool
+
+physeqCompleteFamilies <- subset_samples(physeqStool, 
+                                         Family_Group %in% keepFamilies)
+
+metadataCompleteFamilies <- data.frame(sample_data(physeqCompleteFamilies))
+```
+
+```{r save-metdataCompleteFamilies, eval=FALSE}
+# Write out for future use
+saveRDS(physeqCompleteFamilies, "../data/phyloseq_objects/physeqCompleteFamilies.RDS")
+
+saveRDS(metadataCompleteFamilies, "../data/metadata/metadataCompleteFamilies.RDS")
+```
+
+# Circular Relative Abundance Barplot
+
+```{r format-eyeball-plot}
+phylumAbundance <- MakeAbundanceDF(physeqCompleteFamilies, 
+                                   taxRank = "Phylum", 
+                                   abundanceFilter = 0.0)
+
+# For phyla with < 5% abundance, change to "other" category
+phylumAbundance$Phylum <- as.character(phylumAbundance$Phylum) 
+phylumAbdMut <- phylumAbundance %>%
+  mutate("Name" = ifelse(test = Abundance < 0.05,
+                         yes = "other", no = Phylum))
+# Re-factor "Name"
+phylumAbdMut$Name <- as.factor(phylumAbdMut$Name)
+nameLevels <- levels(phylumAbdMut$Name)
+nameLevels <- nameLevels[nameLevels != "other"]
+nameLevels <- c(nameLevels, "other")
+
+# Apply the new Name levels
+phylumAbdMut$Name <- factor(phylumAbdMut$Name, levels = nameLevels)
+
+# Assign colors: Set 2
+myColors <- brewer.pal(n = length(nameLevels), name = "Set2")
+names(myColors) <- nameLevels
+```
+
+```{r cutom-colors}
+# Assign colors:
+customColors <- brewer.pal(n = length(nameLevels), name = "Set1")
+names(customColors) <- nameLevels
+# add white for "none" category
+customColors <- c(customColors, "none" = "#ffffff")
+
+# Assign colors: cbPaletteGrey
+greyPalette <- cbPaletteGrey[c(2,3,4,5,6,7,1)]
+names(greyPalette) <- nameLevels
+greyPalette <- c(greyPalette, "none" = "#ffffff")
+
+# Assing colors: brewer
+brewerPalette <- c('#8c510a','#bf812d','#dfc27d','#c7eae5','#80cdc1','#35978f','#01665e')
+names(brewerPalette) <- nameLevels
+brewerPalette <- c(brewerPalette, "non" = "#ffffff")
+```
+
+```{r eyeball-pieces-mother, fig.width=11, fig.height=8.5}
+# Mothers - inner circle
+phylumAbdMothers <- filter(phylumAbdMut, InfantMother == "mother")
+
+# Order mothers and apply levels
+motherLevels <- data.frame(sample_data(physeqCompleteFamilies))
+motherLevels <- motherLevels %>% 
+  rownames_to_column(var = "Sample") %>%
+  filter(SampleType == "stool_mother") %>%
+  dplyr::select(Sample, Tarr_Subject_ID)
+motherLevels$Tarr_Subject_ID <- as.character(motherLevels$Tarr_Subject_ID)
+motherLevels <- arrange(motherLevels, Tarr_Subject_ID)
+motherLevelsVec <- as.factor(motherLevels$Sample)
+phylumAbdMothers$Sample <- factor(phylumAbdMothers$Sample, levels = motherLevelsVec)
+
+motherCircle <- ggplot(phylumAbdMothers,
+                       aes(x = Sample, y = Abundance, fill = Name)) +
+  geom_col()  +
+  scale_fill_manual(name = "Name", values = customColors) +
+  scale_y_continuous("", limits = c(-0.5, 1.1)) +
+  coord_polar() +
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        axis.text.y = element_blank())+
+  scale_x_discrete(labels = sampleLabelsVec)
+motherCircle
+```
+
+```{r eyeball-pieces-infant, fig.width=11, fig.height=8.5}
+#----- Infants -----#
+
+phylumAbdInf <- filter(phylumAbdMut, InfantMother == "infant")
+
+# Apply an ordering to the infants:
+infantLevels <- data.frame(sample_data(physeqCompleteFamilies)) 
+infantLevels <- infantLevels %>% 
+  rownames_to_column(var = "Sample") %>%
+  filter(SampleType == "stool_infant") %>%
+  dplyr::select(Sample, Tarr_Subject_ID)
+infantLevels$Tarr_Subject_ID <- as.character(infantLevels$Tarr_Subject_ID)
+infantLevels <- arrange(infantLevels, Tarr_Subject_ID)
+infantLevelsVec <- as.factor(infantLevels$Sample)
+phylumAbdInf$Sample <- factor(phylumAbdInf$Sample, levels = infantLevelsVec)
+
+infantBarPlot <- ggplot(phylumAbdInf,
+                        aes_string(x = "Sample", 
+                                   y = "Abundance", 
+                                   fill = "Name")) +
+  geom_col() +
+  scale_fill_manual(name = "Name", values = myColors) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  scale_x_discrete(labels = sampleLabelsVec)
+infantBarPlot
+
+# Add all infant samples as levels to this data frame so we get empty bars
+#  where infants are missing (families with 1 or 2 infants)
+# Make df with missing infants:
+allInfants <- data.frame("Sample" = c("IC012.2", "IC019.1", "IC021.2", 
+                                          "IC023.2", "IC025.2", "IC036.1", 
+                                          "IC037.2", "IC045.1", "IC046.2"), 
+                         "Tarr_Subject_ID" = c("C012.2", "C019.1", "C021.2", 
+                                               "C023.2", "C025.2", "C036.1", 
+                                               "C037.2", "C045.1", "C046.2"))
+
+allInfants <- rbind(infantLevels, allInfants)
+allInfants$Tarr_Subject_ID <- as.character(allInfants$Tarr_Subject_ID)
+allInfants <- arrange(allInfants, Tarr_Subject_ID)
+allInfants$Sample <- as.factor(allInfants$Sample)
+# apply the "sample" columns as levels to phylumAbdInf
+phylumAbdInf$Sample <- factor(phylumAbdInf$Sample,
+                              levels = allInfants$Sample)
+# Maybe add these samples to the data frame with 0's?
+infPhyAbd <- phylumAbdInf %>% dplyr::select(Sample, Abundance, Name)
+# Add the additional samples
+missingInfants <- data.frame("Sample" = c("IC012.2", "IC019.1", "IC021.2", 
+                                          "IC023.2", "IC025.2", "IC036.1", 
+                                          "IC037.2", "IC045.1", "IC046.2"),
+                             "Abundance" = 0,
+                             "Name" = "none")
+infPhyAbd <- rbind(infPhyAbd, missingInfants)
+
+# Add "none" to myColors
+myColorsPlusNone <- c(myColors, "none" = "#ffffff")
+
+infantBarPlotAll <- ggplot(infPhyAbd,
+                        aes_string(x = "Sample", 
+                                   y = "Abundance", 
+                                   fill = "Name")) +
+  geom_col() +
+  scale_fill_manual(name = "Name", values = myColorsPlusNone) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  scale_x_discrete(labels = sampleLabelsVec)
+infantBarPlotAll
+
+# ciruclar plot
+infantCircle <- ggplot(infPhyAbd,
+                       aes(x = Sample, y = Abundance, fill = Name)) +
+  geom_col() +
+  scale_fill_manual(name = "Name", values = myColorsPlusNone) +
+  scale_y_continuous("", limits = c(-1, 1.1)) +
+  coord_polar() +
+  theme_bw() +
+  scale_x_discrete(labels = sampleLabelsVec) +
+  theme(panel.grid = element_blank(),
+        axis.text.y = element_blank())
+infantCircle
+
+infantCircleCustomClr <- infantCircle + scale_fill_manual(name = "Name", 
+                                                     values = customColors)
+infantCircleCustomClr
+
+```
+
+# Run ADONIS on Metadata
+
+Subset just the infants from physeqStool.
+
+```{r physeqInfants}
+physeqInfants <- physeqStool %>%
+  subset_samples(SampleType == "stool_infant") %>%
+  RemoveMissingTaxa()
+physeqInfants # 1,470 taxa x 33 samples
+```
+
+```{r run-adonis}
+variables <- c("DeliveryRoute", "FeedingType", "Zygosity",
+               "DeliverySite", "PPBMICat", "DlvryBMICat",
+               "Race")
+
+set.seed(787)
+map(variables, RunAdonis, distance = "wunifrac", physeq = physeqInfants)
+```
+
+***
+
+### Session Info
+
+```{r save-images}
+imageName <- paste0("TwinMom16s_Analysis-", Sys.Date(), ".RData")
+save.image(imageName)
+```
+
+```{r session-info}
+Sys.Date()
+getwd()
+sessionInfo()
+```
+

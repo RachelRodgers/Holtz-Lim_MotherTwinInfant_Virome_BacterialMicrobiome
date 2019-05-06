@@ -1,6 +1,10 @@
 #!/usr/bin/env Rscript
 
 # TwinMom16S_dada2.R
+# TwinMom 16S Script 2
+# Several commands in this script are long-running.  It's advised to run the
+#   script from the terminal (in the background) with the command:
+#   Rscript TwinMom16S_dada2.R.
 
 #----- Load Libraries & Data -----#
 library("ShortRead")
@@ -85,7 +89,7 @@ fitGTR <- optim.pml(fitGTR, model = "GTR", optInv = TRUE, optGamma = TRUE,
                     rearrangement = "stochastic", 
                     control = pml.control(trace = 0))
 
-save.image("TwinMom16S_dada2_Pathogen_Server.RData") # read back w/ load() or attach()
+save.image("TwinMom16S_dada2_Pathogen_Server.RData")
 
 #----- Build Phyloseq Objects -----#
 

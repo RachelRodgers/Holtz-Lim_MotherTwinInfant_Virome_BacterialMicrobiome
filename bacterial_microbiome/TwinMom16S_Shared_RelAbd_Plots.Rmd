@@ -1,0 +1,957 @@
+---
+title: "Family Group Shared Relative Abundance Plot"
+author: "Rachel Rodgers"
+date: '`r format(Sys.Date(), "%B, %d, %Y")`'
+output: 
+  html_document:
+      code_folding: show
+---
+
+```{r setup, include=FALSE}
+# TwinMom 16S Script 5
+
+knitr::opts_chunk$set(fig.width=8,
+                      fig.height=6,
+                      fig.path="../analysis/figures/FamilyGroup_Shared_RA_Plot/",
+                      dev=c('png','pdf'),
+                      warning=FALSE,
+                      message=FALSE)
+```
+
+# Intro
+
+This script will generated shared abundance plots between infants/mothers.  This script also generates data used for analyzing phage/bacterial interactions.
+
+# Packages, Class & Function Definitions
+
+```{r load-packages}
+library("phyloseq")
+library("plotly")
+library("microbiome")
+library("decontam")
+library("ggpubr")
+library("ggrepel")
+library("vegan")
+library("pheatmap")
+library("reshape2")
+library("scales")
+library("data.table")
+library("RColorBrewer")
+library("tidyverse")
+
+source("./shared_R_scripts/Helper_Functions.R")
+```
+
+```{r class-definitions}
+
+setClass("Family",
+         representation = representation(family_group = "character",
+                                         member_list = "list",
+                                         family_sum = "numeric"),
+         prototype = prototype(family_group = NA_character_,
+                               member_list = list(),
+                               family_sum = NA_real_))
+
+setClass("FamilyMember", 
+         representation = representation(family_group = "character",
+                                         name = "character",
+                                         sample_designation = "character",
+                                         sample_sum = "numeric",
+                                         ASV_counts = "data.frame"),
+         prototype = prototype(family_group = NA_character_,
+                               name = NA_character_,
+                               sample_designation = NA_character_,
+                               sample_sum = NA_real_))
+```
+
+```{r function-definitions}
+
+#-------------------------------------------------------#
+
+CountASVs <- function(sampleName, abundanceTable) {
+  # abundanceTable - taxa are rows, samples are columns (makes
+  #   subsetting by sample name easier)
+  # From big abundance table, select just the desired sample's counts.
+  sampleAbundance <- abundanceTable %>%
+    dplyr::select(sampleName) %>%
+    rownames_to_column(var = "ASV")
+  # Now remove any rows (ASVs) with a count of 0.
+  sampleAbundanceDF <- filter(sampleAbundance, sampleAbundance[, sampleName] > 0)
+  return(sampleAbundanceDF)
+}
+
+#-------------------------------------------------------#
+
+GetSampleSum <- function(sampleName, physeqObject) {
+  # Call sample_sums() on the physeq object, then subset 
+  #   the desired sum by sample name (returns named vec)
+  named_sum <- sample_sums(physeqObject)[sampleName]
+  # Remove the name that's attached to the sum and return:
+  numeric_sum <- unname(named_sum)
+}
+
+#-------------------------------------------------------#
+
+```
+
+# Read In & Modify Data
+
+```{r read-in-extract-data}
+# Read in physeq object
+physeqStool <- readRDS("../../data/physeqObjects/physeqStool.RDS")
+
+# Pull out sample data
+sampleData <- data.frame(sample_data(physeqStool))
+sampleData <- rownames_to_column(sampleData, var = "Sample")
+
+# Add sample_designation column that will be needed later on
+sample_designation <- vector(mode = "character", length = nrow(sampleData))
+
+for (i in 1:nrow(sampleData)) {
+  if (sampleData[i, "SampleType"] == "stool_infant") {
+    currentID <- sampleData[i, "Tarr_Subject_ID"]
+    split <- str_split(currentID, pattern = "\\.")
+    sample_designation[i] <- paste("infant", split[[1]][2], sep = "_")
+  } else {
+    sample_designation[i] <- "mother"
+  }
+}
+sampleData <- cbind(sampleData, sample_designation)
+
+characterCols <- c("Tarr_Subject_ID", "Family_Group", "SampleType", "sample_designation")
+sampleData[characterCols] <- lapply(sampleData[characterCols],
+                                    as.character)
+# Pull out ASV count table
+abdTable <- as.matrix(otu_table(physeqStool))
+if (!taxa_are_rows(abdTable)) {
+  abdTable <- t(abdTable)
+}
+abdTable <- as.data.frame(abdTable)
+```
+
+# Populate Classes
+
+```{r populate-family-list}
+# This list will hold the Family objects once completed
+familyClassList <- list()
+
+# Loop over the rows of the sample data data frame, building the objects by
+#   familiy group number.  But we only want to build it once, so when we run
+#   across the family group number again we don't want to re-build it.
+
+for (i in 1:nrow(sampleData)) {
+  # Get the current family group from the sample data table
+  currentFamilyGroup <- sampleData[i, "Family_Group"]
+  
+  # Get all the current family names in familyClassList to check if 
+  #   currentFamilyGroup has already been built:
+  familyNames <- names(familyClassList)
+  
+  # If the current family group has not been built, build it:
+  if (!(currentFamilyGroup %in% familyNames)){
+    # Populate the family_group slot:
+    # Create a list of sample names for all the samples in the current family group
+    #   by subsetting the sample data df and extracting the sample names as a char
+    #   vector.  Then, add to the memberList list that will be looped over to
+    #   build each FamilyMember object for the current Family.
+    members <- sampleData %>%
+      filter(Family_Group == currentFamilyGroup) %>%
+      dplyr::select(as.vector("Sample"))
+    memberList <- as.list(members$Sample)
+    
+    # Create an empty list to hold FamilyMember objects which will be added to the 
+    #   Family object in the end.
+    currentFamilyMembersList <- list()
+    
+    # Loop over the sample names in memberList and build a new FamilyMember object for
+    #   each sample:
+    for (sample in memberList) {
+      newMember <- new("FamilyMember",
+                       family_group = currentFamilyGroup,
+                       name = sample, 
+                       sample_designation = sampleData$sample_designation[sampleData$Sample == sample],
+                       sample_sum = GetSampleSum(sample, physeqStool),
+                       ASV_counts = CountASVs(sample, abdTable))
+    # Add this new FamilyMember object to currentFamilyMemberList:
+    currentFamilyMembersList[[sample]] <- newMember
+    }
+    
+    # Now that the member list is complete, get a total read sum to be put into the 
+    #  Family object (sum of each family member's total read count).
+    totalSum <- 0
+    for (member in currentFamilyMembersList) {
+      sampleSum <- member@sample_sum
+      totalSum <- sum(totalSum, sampleSum)
+    }
+    
+    # We now have all the components needed to create new Family object.
+    newFamily <- new("Family", 
+                     family_group = currentFamilyGroup,
+                     member_list = currentFamilyMembersList,
+                     family_sum = totalSum)
+    # Add to list
+    familyClassList[[currentFamilyGroup]] <- newFamily
+  }
+}
+```
+
+# Select "Valid" Families
+
+Families including a mother and at least one infant.
+
+```{r validFamilies}
+
+#----- Determine which family groups are valid -----# 
+
+# A valid Family must have at least one mother and one infant:
+# So a Family object should have a family_member list equal to length 3 or
+# equal to length 2 where one of the sample_designation values is "mother"
+
+# Create a list to hold the valid Family objects:
+validFamilies <- list()
+
+# Loop through the familyClassList and check for valid conditions in each Family object
+for (i in 1:length(familyClassList)) {
+  currentFamily <- familyClassList[[i]]
+  currentFamilyGroup <- currentFamily@family_group
+  currentMembers <- currentFamily@member_list
+  
+  if (length(currentMembers) == 3) {
+    # We know 3 members must include a mom and infants, so add to validFamilies
+    validFamilies[[currentFamilyGroup]] <- currentFamily
+  } else if (length(currentMembers) == 2) {
+    # For 2 members, need to check that the family includes a mom and not just two infants
+    designators <- c() # to hold the members' sample_designation
+    for (j in 1:2) {
+      designators <- c(designators, currentMembers[[j]]@sample_designation)
+    }
+    # If a mom is in the group, add to validFamilies
+    if ("mother" %in% designators) {
+      validFamilies[[currentFamilyGroup]] <- currentFamily
+    }
+  }
+}
+```
+
+# Infant Perspective 
+
+```{r build-infant-perspective-df}
+
+#----- Populate Table for Plotting Infants -----#
+
+# This is for the "infant perspective" plot.
+
+# Goal: generate a data frame holding all infants and all their ASVs (as rows). For each
+#   ASV in the given infant, count the number of reads and
+#   the percentage of the total reads in the infant that the ASV accounts for
+#   ("infant_percent" column.)
+
+allInfantASVTables <- data.frame()
+
+for (k in 1:length(validFamilies)) {
+  family <- validFamilies[[k]]
+  familyMembers <- family@member_list
+
+  # Put each FamilyMember object in its own variable
+  currentMother <- NULL
+  currentInfant1 <- NULL
+  currentInfant2 <- NULL
+
+  for (i in 1:length(familyMembers)) {
+    if (familyMembers[[i]]@sample_designation == "mother") {
+      currentMother <- familyMembers[[i]]
+    } else if (familyMembers[[i]]@sample_designation == "infant_1") {
+      currentInfant1 <- familyMembers[[i]]
+    } else if (familyMembers[[i]]@sample_designation == "infant_2") {
+      currentInfant2 <- familyMembers[[i]]
+    }
+  }
+  
+  # Put infants in a list to loop over:
+  currentInfantList <- list(currentInfant1, currentInfant2)
+  
+  # Remove any NULL elements in the list (in case there is only 1 infant)
+  currentInfantList <- plyr::compact(currentInfantList)
+
+  # Loop over the infant list and populate the "infant perspective" data frame:
+  #   allInfantASVTables - for each infant samples, holds the ASV, 
+  #     its percentage of the total reads in the infant, and whether it's shared with mother
+  #   (Later) to get the total percent shared and not shared for each infant (for plotting)
+  #     allInfantASVTables %>% group_by(sample, shared) %>% summarise(percent = sum(infants))
+  
+  for (i in 1:length(currentInfantList)) {
+    
+    current_infant <- currentInfantList[[i]]
+    #currentInfantName <- current_infant@name
+    
+    # build infant's identifier (FamGroup.1 or FamGroup.2)
+    infantDesignation <- current_infant@sample_designation
+    infantNumber <- (str_split(infantDesignation, "_"))[[1]][2]
+    infantIdentifier <- paste(family@family_group, infantNumber, sep = ".")
+    
+    # merge current infant's ASV counts with mother's
+    infantTable <- merge(current_infant@ASV_counts,
+                         currentMother@ASV_counts,
+                         by = "ASV", all = TRUE)
+    
+    # Replace column names with the samples' sample_designations for easier
+    #   plotting downstream:
+    for (j in 1:ncol(infantTable)) {
+      currentColName <- names(infantTable)[j]
+      if (currentColName != "ASV") {
+        setnames(infantTable,
+                 old = currentColName,
+                 new = familyMembers[[currentColName]]@sample_designation)
+      }
+    }
+    
+    # Collapse table to figure out what is shared from infant's perspective -
+    #   remove any ASVs that have a count of NA in the current infant.
+    infantTable <- infantTable[!(is.na(infantTable[[infantDesignation]])), ]
+    
+    # Add a column to indicate if each ASV (row) in the collapsed table is 
+    #   shared with mom or not. If the ASV has a value of NA in mother column
+    #   then it cannot be shared between current infant and mom.
+    infantTable <- infantTable %>%
+      mutate("shared" = ifelse(!(is.na(mother)), yes = TRUE, no = FALSE),
+             "sample" = infantIdentifier) 
+    
+    # Prepare to add this table to a bigger list, but don't add until end!
+    setnames(infantTable, old = infantDesignation, new = "read_count")
+      
+    # For this infant, calculate percent of reads that are from ASVs that
+    #   are shared with mom, and not shared with mom (keep this table).
+    infantSum <- sum(infantTable$read_count)
+    infantSharedSum <- sum(infantTable$read_count[infantTable$shared == TRUE])
+    infantNotSharedSum <- sum(infantTable$read_count[infantTable$shared == FALSE])
+      
+    # Add the infantTable (the one with ASVs as rows) to larger data frame
+    infantTablePercentages <- infantTable %>%
+      mutate("infant_percent" = read_count/infantSum) %>%
+      dplyr::select(-c("mother"))
+    
+    # Add infant sample name to table
+    #infantTablePercentages <- cbind(infantTablePercentages,
+                                    #"infant_sample" = currentInfantName)
+    
+    allInfantASVTables <- rbind(allInfantASVTables, infantTablePercentages)
+  }
+}
+```
+
+# Infant Perspective Relative Abundance
+
+```{r infantPerspectiveRA, fig.width=9, fig.height=6}
+
+#----- Modify Data Frame for Plotting "Infant Perspective" -----#
+
+# For each infant in allInfantASVTables, summarize the total percentage
+#   of reads from ASVs shared with mom and ASVs not shared with mom.
+
+infantPerspectiveRA <- allInfantASVTables %>%
+  group_by(sample, shared) %>%
+  summarise(percent = sum(infant_percent))
+
+# Also add a delivery route column for plotting in Prism
+#   First create a simplified TarrID in the sampleData
+sampleDataModified <- sampleData %>%
+  mutate("short_id" = str_remove(Tarr_Subject_ID, pattern = "C0*"))
+#   Generate a look-up-table:
+infantDlvryLUT <- as.character(sampleDataModified$DeliveryRoute)
+names(infantDlvryLUT) <- as.character(sampleDataModified$short_id)
+#   Add the info to infantPerspectiveRA
+infantPerspectiveRA$sample <- as.character(infantPerspectiveRA$sample)
+infantPerspectiveRA$infant_delivery_route <- infantDlvryLUT[infantPerspectiveRA$sample]
+
+# Create levels to organize the x-axis
+infantLevels <- as.numeric(unique(infantPerspectiveRA$sample))
+infantLevels <- as.character(infantLevels[order(infantLevels)])
+infantPerspectiveRA$sample <- factor(infantPerspectiveRA$sample,
+                                        levels = infantLevels)
+
+# Change order of shared variable
+infantPerspectiveRA$shared <- factor(infantPerspectiveRA$shared,
+                                     levels = c("TRUE", "FALSE"))
+
+infantPerspectivePlot <- ggplot(infantPerspectiveRA,
+                                aes(x = sample, y = percent, 
+                                    fill = shared)) +
+  geom_bar(stat = "identity") +
+  ylab("Percent") +
+  xlab("Infant") +
+  labs(fill = "OTU Shared with Mother:") +
+  ggtitle("Relative Abundance of Reads in Infant Samples") +
+  theme(axis.text.x = element_text(angle = 90),
+        plot.title = element_text(hjust = 0.5))
+infantPerspectivePlot
+```
+
+```{r write-out-infantPerspectiveRA, eval=FALSE}
+write.table(infantPerspectiveRA, 
+            file = "../../data/data_for_prism/infantPerspectiveRA.txt",
+            quote = FALSE, sep = "\t", row.names = FALSE)
+```
+
+```{r data-for-phage-bacteria-interaction, eval=FALSE}
+# Generate a count table for just the shared taxa
+allInfantASVTablesShared <- filter(allInfantASVTables, shared == TRUE)
+sharedTaxa <- unique(allInfantASVTablesShared$ASV) #116
+
+sharedAbdTable <- abdTable %>%
+  rownames_to_column(var = "ASV") %>%
+  filter(ASV %in% sharedTaxa) %>%
+  column_to_rownames(var = "ASV")
+dim(sharedAbdTable) # 116 x 57
+
+# transpose to put samples as rows
+trspSharedAbdTable <- t(sharedAbdTable)
+
+trspSharedAbdTable <- rownames_to_column(as.data.frame(trspSharedAbdTable),
+                                         var = "Sample")
+
+# Now add Family_Group sample, which is just a number
+# Make LUT to get family number from sample - 
+familyNumberLUT <- sampleData$Family_Group
+names(familyNumberLUT) <- sampleData$Sample
+# Add Family_Group column to the transposed abundance table
+trspSharedAbdTable <- mutate(trspSharedAbdTable,
+                             "Family_Group" = familyNumberLUT[Sample]) %>%
+  dplyr::select(Sample, Family_Group, everything())
+
+# Filter out the samples that aren't included in the "valid families" group
+#   since I just extracted count data for these selected taxa but from all
+#   the stool samples.
+validFamilyGroups <- names(validFamilies)
+trspSharedAbdTable <- trspSharedAbdTable %>%
+  filter(Family_Group %in% validFamilyGroups)
+
+
+# Add Sample_Designation Column - unable to do this with a mutate for some reason
+#   so need to append an empty column ahead of time
+trspSharedAbdTable$Sample_Designation <- NA
+for (i in 1:nrow(trspSharedAbdTable)) {
+  currentSample <- trspSharedAbdTable[i, "Sample"]
+  currentFamGroup <- trspSharedAbdTable[i, "Family_Group"]
+  sampleDesignation <- familyClassList[[currentFamGroup]]@member_list[[currentSample]]@sample_designation
+  trspSharedAbdTable[i, "Sample_Designation"] <- sampleDesignation
+}
+
+# rearrange the columns
+trspSharedAbdTable <- dplyr::select(trspSharedAbdTable,
+                       Sample, Family_Group, Sample_Designation, everything())
+
+write.table(trspSharedAbdTable, file = "../../data/transmitted_ASV_count_table.txt",
+            quote = FALSE, sep = "\t", row.names = FALSE)
+```
+
+```{r shared-ASVs-by-family, eval=FALSE}
+write.table(allInfantASVTablesShared, file = "../../data/transmitted_ASVs_by_Infant_Number.txt",
+            quote = FALSE, sep = "\t", row.names = FALSE)
+```
+
+Get the taxonomic information for these shared taxa.
+
+```{r shared-ASVs-by-family-taxonomy}
+taxonomyDF <- as.data.frame(tax_table(physeqStool))
+sharedASVTaxonomy <- taxonomyDF %>%
+  rownames_to_column(var = "ASV") %>%
+  filter(ASV %in% sharedTaxa)
+```
+
+```{r save-shared-ASV-taxonomy, eval=FALSE}
+write.table(sharedASVTaxonomy, file = "../../data/transmitted_ASVs_taxonomy.txt",
+            quote = FALSE, sep = "\t", row.names = FALSE)
+```
+
+# Infant Perspective Richness
+
+```{r infantPerspectiveRichness, fig.width=9, fig.height=6}
+
+# Generate a plot that is similar to the one above, but by richness instead
+#   of relative abundance of reads.
+
+# Group allInfantASVTables by sample and shared (T/F) then count
+infantPerspectiveRichness <- allInfantASVTables %>%
+  group_by(sample, shared) %>%
+  summarise(number_of_ASVs = n())
+
+# Add column with percentages to infantPerspectiveRichness.
+# Get total ASV count for each sample:
+infantASVTotals <- infantPerspectiveRichness %>%
+  group_by(sample) %>%
+  summarise(sum = sum(number_of_ASVs))
+
+# Convert from data frame to named vector. This vector of sums will be used
+#   to generate the percentages of shared and unshared ASVs in each sample.
+infantASVTotalsVec <- infantASVTotals$sum
+names(infantASVTotalsVec) <- infantASVTotals$sample
+
+infantPerspectiveRichness <- infantPerspectiveRichness %>%
+  mutate(percentage = number_of_ASVs/infantASVTotalsVec[sample])
+
+# Apply levels
+infantPerspectiveRichness$shared <- factor(infantPerspectiveRichness$shared,
+                                      levels = c("TRUE", "FALSE"))
+infantPerspectiveRichness$sample <- factor(infantPerspectiveRichness$sample,
+                                      levels = infantLevels)
+
+infantPerspectiveRichnessPlot <- ggplot(infantPerspectiveRichness,
+                                        aes(x = sample,
+                                            y = percentage,
+                                            fill = shared)) +
+  geom_bar(stat = "identity") +
+  ylab("Percent") +
+  xlab("Infant") +
+  labs(fill = "OTU Shared with Mother:") +
+  ggtitle("Infant Richness") +
+  theme(axis.text.x = element_text(angle = 90),
+        plot.title = element_text(hjust = 0.5))
+infantPerspectiveRichnessPlot
+```
+
+# Infant "Shared Portion" Plots - Currently Not Evaluated
+
+### Not evaluated
+```{r write-out-infantPerspectiveRichness, eval=FALSE}
+write.table(infantPerspectiveRichness,
+            file = "../analysis/figures/data_for_prism/infantPerspectiveRichness.txt",
+            quote = FALSE, sep = "\t", row.names = FALSE)
+
+# Write out a data table just showing the number of OTUs shared with mom for each infant
+infantSharedOTUs <- infantPerspectiveRichness %>%
+  filter(shared == TRUE) %>%
+  select(sample, count)
+setnames(infantSharedOTUs, "count", "number_shared_otus")
+
+write.table(infantSharedOTUs, 
+            file = "../analysis/figures/data_for_prism/infantSharedOTUs.txt",
+            quote = FALSE, sep = "\t", row.names = FALSE)
+```
+### Not evaluated
+```{r infantShareOTUsPlot, fig.width=9, fig.height=6, eval=FALSE}
+ggplot(infantSharedOTUs, aes(x = sample, y = number_shared_otus)) +
+  geom_point() +
+  theme_pubr() +
+  ylab("Number of OTUs Shared with Mother") +
+  ggtitle("Example Dot Plot")
+```
+### Not evaluated
+```{r infantSharedPlot, fig.width=9, fig.height=6, eval=FALSE}
+
+#----- Build Data Frame for Plotting the Shared Portion of Infants -----#
+
+sharedASVAllInfants <- allInfantASVTables %>%
+  filter(shared == TRUE) %>%
+  select(-c(infant_percent))
+# Get the sum for the ASVs that are shared for each infant
+infantSharedSums <- sharedASVAllInfants %>% 
+  group_by(sample) %>%
+  summarise(shared_sum = sum(infant))
+# Change to named vector
+infantSharedSumsVec <- infantSharedSums$shared_sum
+names(infantSharedSumsVec) <- infantSharedSums$sample
+# Use the sums to mutate a new column in sharedASVAllInfants to show percent each
+#   ASV is of the total shared
+#  Mutate() won't work here thanks to NSE, so need an explicit loop
+shared_percent <- vector(mode = "numeric", length = nrow(sharedASVAllInfants))
+for (i in 1:nrow(sharedASVAllInfants)) {
+  currentSample <- sharedASVAllInfants[i, "sample"]
+  sampleSharedSum <- infantSharedSumsVec[[currentSample]]
+  percent <- sharedASVAllInfants[i, "infant"]/sampleSharedSum
+  shared_percent[i] <- percent
+}
+sharedASVAllInfants <- cbind(sharedASVAllInfants, "shared_percent" = shared_percent)
+
+# Apply same levels as in previous graph
+sharedASVAllInfants$sample <- factor(sharedASVAllInfants$sample,
+                                     levels = infantLevels)
+
+infantSharedPlot <- ggplot(sharedASVAllInfants,
+       aes(x = sample, y = shared_percent, fill = ASV)) +
+  geom_bar(stat = "identity", color = "black") +
+  ylab("Percent of Shared Portion") +
+  xlab("Infant") +
+  ggtitle("Relative Abundance of Reads of OTUs Shared with Mother") +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 90))
+infantSharedPlot
+```
+
+# Mother Perspective 
+
+```{r motherPerspectiveRA, fig.width=11, fig.height=8.5}
+
+#----- Build Data Frame for "Mother's Perspective" Plot -----#
+
+motherPerspectiveRA <- data.frame()
+
+# Loop over the valid families (those with at least one mom & one infant)
+
+for (k in 1:length(validFamilies)) {
+  
+  family <- validFamilies[[k]]
+  familyMembers <- family@member_list
+  
+  # We need to know the number of family members to later determine if mom
+  #   can share an ASV with only one or both infants
+  numberOfMembers <- length(familyMembers)
+
+  # Merge the family members' ASV counts
+  fmASVDFList <- list()
+  for (i in 1:length(familyMembers)) {
+    fmASVDFList[[i]] <- familyMembers[[i]]@ASV_counts
+    }
+  # Merge the dataframes in asvDFList into one big data frame:
+  fmMergedASVDFs <- Reduce(f = function(df1, df2) {merge(x = df1, y = df2,
+                                                         by = "ASV", all = TRUE)},
+                           x = fmASVDFList)
+  
+  # Replace the column names from the sample names to the samples' sample_designations
+  for (i in 1:ncol(fmMergedASVDFs)) {
+    currentColName <- names(fmMergedASVDFs)[i]
+    if (currentColName != "ASV") {
+      setnames(fmMergedASVDFs,
+               old = currentColName,
+               new = familyMembers[[currentColName]]@sample_designation)
+    }
+  }
+  
+  # Since we're concerned with the mother's perspective, remove rows (ASVs)
+  #   where mom is NA - as she can't share a missing ASV...
+  motherTable <- fmMergedASVDFs %>%
+    filter(!is.na(mother))
+  
+  # Sum the total read counts for mom
+  motherSum <- sum(motherTable$mother)
+
+  # Determine if mom ASV is shared with one or both infants:
+  #   This will vary depending on if there are only 2, or all 3 family members.
+  #   First determine if any or all values in the row are NA.
+  
+  # For a 3-person family:
+  #   If both are NA - mother only
+  #   If one is NA and one is not - single infant
+  #   If none are NA - both infants
+  
+  # For a 2-person family:
+  #   If one is NA - mother only
+  #   If none are NA - mother and sing infant
+  
+  # Function to count the number of NA's:
+  count_na <- function(x) sum(is.na(x))
+  
+  # Add a column to the mother table to determine how many NAs are in each row.
+  #   Will results in a value of 0, 1, (or 2 for 3-person families).
+  motherTable <- motherTable %>% 
+    mutate("present_in" = apply(., 1, count_na))
+  
+  # Now rename the values 0, 1, and 2
+  if (numberOfMembers == 3) {
+    # Rename the values 0, 1, and 2
+    motherTable$present_in <- factor(motherTable$present_in,
+                                     levels = c("0", "1", "2"),
+                                     labels = c("mother-both infants",
+                                                "mother-single infant",
+                                                "mother only"))
+    
+    # For "mother-single infant" category, determine which infant it is:
+    motherTable$present_in <- as.character(motherTable$present_in)
+    
+    for (rowIdx in 1:nrow(motherTable)) {
+      if (motherTable[rowIdx, "present_in"] == "mother-single infant") {
+        currentRow <- motherTable[rowIdx, ]
+        # Remove "ASV", "mother", "present_in" and NA
+        currentRowTrimmed <- currentRow %>%
+          dplyr::select(-c("ASV", "mother", "present_in"))
+        # What infant is left?
+        remainingInfant <- colnames(currentRowTrimmed)[!is.na(currentRowTrimmed)]
+        # Change the "present_in" category
+        motherTable[rowIdx, "present_in"] <- paste("mother",
+                                                   remainingInfant, 
+                                                   sep = " ")
+      }
+    }
+    
+    } else if(numberOfMembers == 2) {
+      # Rename the values 0 and 1 (there cannot be a 2)
+      motherTable$present_in <- factor(motherTable$present_in,
+                                       levels = c("0", "1"),
+                                       labels = c("mother-single infant",
+                                                  "mother only"))
+      }
+
+  # collapse this table down, add percentage column and mother identifier
+  motherTableCollapsed <- motherTable %>%
+    group_by(present_in) %>%
+    summarise(categorySum = sum(mother)) %>%
+    mutate("percent_of_total" = categorySum/motherSum,
+           "mother" = family@family_group)
+
+  # add to large df
+  motherPerspectiveRA <- rbind(motherPerspectiveRA,
+                              motherTableCollapsed)
+
+}
+```
+
+# Mother Perspective Relative Abundance
+
+```{r format-motherPerspectiveRA, fig.width=11, fig.height=8.5}
+
+# for faceting, determine which families have two infants, and which have one
+familyGroupNames <- vector(mode = "character", 
+                           length = length(validFamilies))
+numFamilyMembers <- vector(mode = "integer",
+                           length = length(validFamilies))
+for (i in 1:length(validFamilies)) {
+  familyGroupNames[i] <- validFamilies[[i]]@family_group
+  numFamilyMembers[i] <- length(validFamilies[[i]]@member_list)
+}
+
+numFamMemsDF <- data.frame("Family" = as.numeric(familyGroupNames),
+                           "Number_of_Members" = numFamilyMembers)
+
+numFamMemsDF <- arrange(numFamMemsDF, Number_of_Members, Family)
+
+# Levels to apply to FamGroup column
+familyLevels <- as.character(numFamMemsDF$Family)
+
+# Also add column to designate whether family has one or two infants so the
+#   plot can be faceted
+singleInfantFam <- numFamMemsDF %>% 
+  filter(Number_of_Members == 2) %>%
+  dplyr::select(Family)
+singleInfantFam <- as.vector(as.character(singleInfantFam$Family))
+
+twoInfantFam <- numFamMemsDF %>%
+  filter(Number_of_Members == 3) %>%
+  dplyr::select(Family)
+twoInfantFam <- as.vector(as.character(twoInfantFam$Family))
+
+# Add new column to allMothersSharedTables
+motherPerspectiveRA <- motherPerspectiveRA %>%
+  mutate("status" = ifelse(mother %in% twoInfantFam,
+                           yes = "two infants", no = "single infant"))
+
+motherPerspectiveRA$mother <- factor(motherPerspectiveRA$mother,
+                                    levels = familyLevels)
+
+motherPerspectivePlot <- ggplot(motherPerspectiveRA,
+                                aes(x = mother, 
+                                    y = percent_of_total,
+                                    fill = present_in,
+                                    label = round(percent_of_total, digits = 3))) +
+  geom_bar(stat = "identity", color = "gray14", width = 0.95) +
+  geom_text(position = position_stack(vjust = 0.5)) +
+  scale_fill_brewer(palette = "Set3") +
+  ylab("Percentage") +
+  xlab("Mother") +
+  labs(fill = "OTU Found In:") +
+  ggtitle("Relative Abundance of Reads in Mother Samples") +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  facet_wrap(~status, nrow = 2, scales = "free")
+motherPerspectivePlot
+
+```
+
+```{r write-out-motherPerspectiveRA, eval=FALSE}
+write.table(motherPerspectiveRA, 
+            file = "../../data/data_for_prism/motherPerspectiveRA.txt",
+            quote = FALSE, sep = "\t", row.names = FALSE)
+```
+
+# Mother Perspective Richness
+
+```{r motherPerspectiveRichness}
+# Create table where each row is an ASV found in every mom
+# column for current mother, current infant, and whether that ASV (row) is shared
+#   between them (T/F)
+# Then summarize this table to get info needed.
+
+#----- Populate Table for Determining Mother's Shared Richness -----#
+
+motherPerspectiveRichness <- data.frame()
+motherPerspectivePairwiseRA <- data.frame()
+
+for (famIdx in 1:length(validFamilies)) {
+  family <- validFamilies[[famIdx]]
+  familyMembers <- family@member_list
+
+  # put each family member sample in own variable
+  currentMother <- NULL
+  currentInfant1 <- NULL
+  currentInfant2 <- NULL
+
+  for (i in 1:length(familyMembers)) {
+    if (familyMembers[[i]]@sample_designation == "mother") {
+      currentMother <- familyMembers[[i]]
+    } else if (familyMembers[[i]]@sample_designation == "infant_1") {
+      currentInfant1 <- familyMembers[[i]]
+    } else if (familyMembers[[i]]@sample_designation == "infant_2") {
+      currentInfant2 <- familyMembers[[i]]
+    }
+  }
+
+  # Put infants in a list to loop over
+  currentInfantList <- list(currentInfant1, currentInfant2)
+  # Remove any NULL elements in the list (will be one NULL if only one infant)
+  currentInfantList <- plyr::compact(currentInfantList)
+
+  # Loop over the infant list and populate the data frame:
+  for (infIdx in 1:length(currentInfantList)) {
+    
+    current_infant <- currentInfantList[[infIdx]]
+    infantDesignation <- current_infant@sample_designation
+    currentInfantSamp <- current_infant@name
+    
+    # merge current infant's asv counts with mother's
+    motherTable <- merge(current_infant@ASV_counts,
+                         currentMother@ASV_counts,
+                         by = "ASV", all = TRUE)
+    
+    # replace column names with the samples' sample_designations
+    for (j in 1:ncol(motherTable)) {
+      currentColName <- names(motherTable)[j]
+      # Add new column with the current col name
+      if (currentColName != "ASV") {
+        setnames(motherTable,
+                 old = currentColName,
+                 new = familyMembers[[currentColName]]@sample_designation)
+      }
+    }
+    
+    # add column to designate whether each ASV is shared between mom and current infant
+    motherTable <- motherTable[!(is.na(motherTable$mother)), ]
+    motherTable <- motherTable %>%
+      mutate("shared" = ifelse(!(is.na(motherTable[[infantDesignation]])),
+             yes = TRUE, no = FALSE))
+    
+    # Collapse for Richness Information
+    motherTableRichness <- motherTable %>%
+      group_by(shared) %>%
+      summarise("number_of_otus" = n())
+    
+    # Add "mother" and "infant" column to richness df
+    motherTableRichness <- cbind("mother" = family@family_group,
+                                 "infant" = infantDesignation,
+                                 motherTableRichness,
+                                 "total_otus_in_mother" = nrow(currentMother@ASV_counts))
+    
+    motherPerspectiveRichness <- rbind(motherPerspectiveRichness,
+                                      motherTableRichness)
+    
+    # Also create data frame to hold relative abundance information
+    motherSharedRA <- motherTable %>% 
+      group_by(shared) %>% 
+      summarise("summed_ASV_counts" = sum(mother)) 
+    
+    motherSharedRA <- motherSharedRA %>%
+      mutate(infant = infantDesignation,
+             mother = paste("mother", family@family_group, sep = "_"))
+    
+    # Add a percentage column
+    motherSharedRA <- motherSharedRA %>%
+      mutate("percent_of_total" = summed_ASV_counts/sum(summed_ASV_counts))
+    
+    motherSharedRA <- cbind(motherSharedRA, "infant_sample" = currentInfantSamp)
+    
+    motherPerspectivePairwiseRA <- rbind(motherPerspectivePairwiseRA, motherSharedRA)
+  }
+}
+
+```
+
+```{r modify-motherPerspectiveRichness}
+# modify and get stats
+motherPerspectiveRichness <- motherPerspectiveRichness %>%
+  filter(shared == TRUE)
+
+# Add column that shows percentage of otus that are shared
+motherPerspectiveRichness <- mutate(motherPerspectiveRichness,
+                           "percent_shared_with_infant" = number_of_otus/total_otus_in_mother)
+
+# Look at summary information
+summary(motherPerspectiveRichness$number_of_otus)
+summary(motherPerspectiveRichness$percent_shared_with_infant)
+```
+
+```{r modify-motherPerspectivePairwiseRA}
+# Add column to show what mother-infant pair is being looked at in motherPerspectivePairwiseRA
+motherPerspectivePairwiseRA <- motherPerspectivePairwiseRA %>%
+  mutate("pair" = paste(mother, infant, sep = ":"))
+
+# Add a delivery route and tarr ID column to motherPerspectivePairwiseRA
+additionalInfantInfo <- sampleData %>% 
+  dplyr::select(Sample, Tarr_Subject_ID, DeliveryRoute)
+# Change everything to character from factors
+charCols <- c("Sample", "Tarr_Subject_ID", "DeliveryRoute")
+additionalInfantInfo[charCols] <- lapply(additionalInfantInfo[charCols],
+                                         as.character)
+
+# Make the different look-up-tables:
+routeLUT <- additionalInfantInfo$DeliveryRoute
+names(routeLUT) <- additionalInfantInfo$Sample
+
+tarrLUT <- additionalInfantInfo$Tarr_Subject_ID
+names(tarrLUT) <- additionalInfantInfo$Sample
+
+motherPerspectivePairwiseRA$infant_sample <- as.character(motherPerspectivePairwiseRA$infant_sample)
+
+# Add Delivery Route:
+motherPerspectivePairwiseRA$infant_deliveryRoute <- as.character(routeLUT
+                                                                 [motherPerspectivePairwiseRA$infant_sample])
+
+# Add Tarr ID:
+motherPerspectivePairwiseRA$infant_TarrID <- as.character(tarrLUT
+                                                          [motherPerspectivePairwiseRA$infant_sample])
+
+
+# Modify the Tarr ID so it's just ##.#
+motherPerspectivePairwiseRA <- mutate(motherPerspectivePairwiseRA,
+                                      "short_TarrID" = str_remove(infant_TarrID,
+                                                                  pattern = "C0*"))
+
+
+```
+
+```{r write-out-for-prism, eval=FALSE}
+write.table(motherPerspectiveRichness, 
+            file = "../../data/data_for_prism/motherPerspectiveRichness.txt",
+            quote = FALSE, sep = "\t", row.names = FALSE)
+
+
+
+write.table(motherPerspectivePairwiseRA,
+            file = "../../data/data_for_prism/motherPerspectivePairwiseRA.txt",
+            quote = FALSE, sep = "\t", row.names = FALSE)
+```
+
+# Mother Perspective Pairwise Relative Abundance
+
+This plot is a breakdown of the mother perspective relative abundance plot, but instead of including one bar for each family unit, there is one bar for every mother-infant pair, meaning mothers with data for two infants will have two bars in the plot.
+
+```{r motherPerspectivePairwiseRA-plot, fig.width=9, fig.height=6}
+ggplot(motherPerspectivePairwiseRA,
+       aes(x = pair, y = percent_of_total, fill = shared)) +
+  geom_bar(stat = "identity") +
+  ylab("Percent") +
+  xlab("Mother") +
+  labs(fill = "OTU Shared with Infant:") +
+  ggtitle("Relative Abundance of Reads Shared between Mom & Infant") +
+  theme(axis.text.x = element_text(angle = 90),
+        plot.title = element_text(hjust = 0.5))
+
+```
+
+```{r save-some-data, eval=FALSE}
+# infantPerspectiveRA
+saveRDS(infantPerspectiveRA, file = "../../data/infantPerspectiveRA.RDS")
+```
+
+
+```{r}
+Sys.Date()
+getwd()
+sessionInfo()
+```
