@@ -1,0 +1,91 @@
+---
+title: "Twin/Mom 16S Quality & Error Rate Checking (Pathogen Server)"
+author: "Rachel Rodgers"
+date: '`r format(Sys.Date(), "%B, %d, %Y")`'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.width=8,
+                      fig.height=6,
+                      warning=FALSE,
+                      message=FALSE)
+```
+
+```{r load-libraries}
+library("dada2")
+library("msa")
+library("phangorn")
+library("phyloseq")
+library("tidyverse")
+```
+
+```{r set-directories}
+#----- Raw Data & Filtered Data Paths -----#
+
+inputDir <- "../data/demultiplexed"
+filteredDir <- file.path(inputDir, "filtered")
+
+#----- Taxonomy Database Paths -----#
+taxonomyDBPath <- "../../../../databases/dada2_taxonomy/"
+# GreenGenes
+ggDB <- file.path(taxonomyDBPath, "gg_13_8_train_set_97.fa.gz")
+# RDP
+rdpDB <- file.path(taxonomyDBPath, "rdp_train_set_16.fa.gz")
+rdpDBSpecies <- file.path(taxonomyDBPath, "rdp_species_assignment_16.fa.gz")
+# Silva
+silvaDB <- file.path(taxonomyDBPath, "silva_nr_v128_train_set.fa.gz")
+silvaDBSpecies <- file.path(taxonomyDBPath, "silva_species_assignment_v128.fa.gz")
+# hitDB
+hitDB <- file.path(taxonomyDBPath, "hitdb_v1.00.fa.gz")
+```
+
+Check raw read quality.
+
+```{r rawQualPlot, fig.width=9, fig.height=6}
+rawQualPlot <- plotQualityProfile(inputDir, aggregate = TRUE)
+rawQualPlot
+```
+
+Read quality begins to diminish around 225 base pairs, so will trim reads back to this length.
+
+```{r filter-and-trim, eval=FALSE}
+inputFiles <- sort(list.files(inputDir, pattern = "fastq"))
+
+filterAndTrim(fwd = file.path(inputDir, inputFiles),
+              filt = file.path(filteredDir, inputFiles),
+              trimLeft = 10, truncLen = 225, maxEE = 2, truncQ = 11,
+              maxN = 0, rm.phix = TRUE, compress = TRUE, verbose = TRUE)
+```
+
+Infer error rates.
+
+```{r filteredFiles}
+# Get list of filtered files and assign sample names to them
+filteredFiles <- list.files(filteredDir, pattern = "fastq", full.names = TRUE)
+# Get the sample names by removing the .fastq and path 
+sampleNames <- sapply(strsplit(basename(filteredFiles), "\\.fastq"), `[`, 1)
+# Assign the sample names to the filteredFiles vector
+names(filteredFiles) <- sampleNames
+```
+
+```{r errF, fig.width=9, fig.height=6}
+set.seed(100)
+
+errF <- learnErrors(filteredFiles, nread = 3e6, multithread = TRUE)
+
+errorPlot <- plotErrors(errF, nominalQ = TRUE)
+errorPlot
+```
+
+Red line is what is expected based on quality score, black line represents estimate, black dots are the observed.  Black dots should track well with the black line.  Here it looks pretty good.
+
+```{r save-data}
+saveRDS(errF, "errF.RDS")
+save.image("TwinMom16S_Quality_ErrorRate_Pathogen_Server.RData") # read back w/ load() or attach()
+writeLines(capture.output(sessionInfo()), 
+           "TwinMom16S_Quality_ErrorRate_Pathogen_Server_session_info.txt")
+Sys.Date()
+getwd()
+sessionInfo()
+```
