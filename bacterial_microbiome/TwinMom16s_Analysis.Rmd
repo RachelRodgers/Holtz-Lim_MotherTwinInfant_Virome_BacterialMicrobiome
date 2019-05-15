@@ -133,6 +133,51 @@ familyCompPlot <- ggplot(familyAbdDF,
 familyCompPlot
 ```
 
+# PCoA of Weighted UniFrac Distances
+
+```{r calculate-ord-objects}
+set.seed(787)
+unweightedOrd <- ordinate(physeqStool, method = "PCoA", distance = "unifrac")
+weightedOrd <- ordinate(physeqStool, method = "PCoA", distance = "wunifrac")
+```
+
+```{r edit-samp-data}
+# Change order of InfantMother (mother first)
+sample_data(physeqStool)$InfantMother <- factor(sample_data(physeqStool)$InfantMother,
+                                                levels = c("mother", "infant"))
+sample_data(physeqStool)$InfantMother <- factor(sample_data(physeqStool)$InfantMother,
+                                                labels = c("Mother", "Infant"))
+```
+
+```{r weighted-unifrac-pcoa, fig.width=9, fig.height=9}
+weightedUniFracPCoA <- plot_ordination(physeqStool,
+                                       ordination = weightedOrd,
+                                       shape = "InfantMother",
+                                       color = "InfantMother") +
+  geom_point(size = 6) +
+  scale_color_manual(values = c("#FFB8FF", "#50C367")) +
+  scale_shape_manual(values = c(16, 15)) +
+  geom_text_repel(aes_string(label = "Tarr_Subject_ID"),
+                  size = 3.5, color = "gray30") +
+  theme_bw() +
+  theme(legend.position = "top",
+        legend.text = element_text(size = 16),
+        axis.text = element_text(size = 16),
+        axis.title = element_text(size = 16),
+        legend.title = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.ticks = element_line(color = "black", size = 1.5),
+        panel.border = element_rect(color = "black", fill = NA, size = 1.5))
+  
+weightedUniFracPCoA
+```
+
+```{r adonis}
+set.seed(787)
+RunAdonis(physeqStool, "InfantMother", "wunifrac")
+```
+
 # Pairwise Distance Boxplots Using Unweighted and Weighted UniFrac
 
 Generate unweighted UniFrac pairwise distance data frame:
