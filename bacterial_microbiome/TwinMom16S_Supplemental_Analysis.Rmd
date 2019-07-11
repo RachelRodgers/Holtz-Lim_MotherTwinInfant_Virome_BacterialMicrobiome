@@ -1,0 +1,809 @@
+---
+title: "TwinMom 16S Supplemental Analysis"
+author: "Rachel Rodgers"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output: html_document
+---
+
+```{r global-options, warning=FALSE, message=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning=FALSE,
+                      message=FALSE,
+                      echo = FALSE)
+```
+
+```{r load-packages}
+library("phyloseq")
+library("data.table")
+library("FSA")
+library("ggrepel")
+library("ggpubr")
+library("tidyverse")
+
+source("./shared_R_scripts/Helper_Functions.R")
+```
+
+# Supplementary Figure 1 
+
+Calculate p-values for the pairwise weighted and unweighted UniFrac distance of samples segregated by various metadata.  Some metadata variables will consider only infant data, and others will incorporate mothers' and infants' data.  Values are calculated with and without regard to familial relations.
+
+1. Infants Only (regardless of relation)
+  * Zygosity
+  * Delivery Route
+  * Feeding Type
+2. All Samples (regardless of relation) 
+  * Delivery Site
+  * Race
+  * Pre-pregnancy BMI Category
+  * Post-pregnancy BMI Category
+  * Mother or Infant 
+    * Table 1: within all infants vs. within all mothers ("allSamplesDF")
+    * Table 2: within related mothers/infants vs. within unrelated mothers/infants ("allSamplesDF")
+3. Mother-Infant (related)
+  * Zygosity
+  * Delivery Route
+  * Feeding Type
+  * Delivery Site
+  * Race
+  * Pre-pregnancy BMI Category
+  * Post-pregnancy BMI Category
+4. (Additional) Relate Infants Only
+  * Zygosity
+  
+In this script "TwinMom16S_Analysis.Rmd" all pairwise weighted UniFrac distances are calculated between all mothers and all infants ("../data/weightedDistDFNoDupes.RDS").  All pairwise unweighted distances are calculated between all mothers and all infants ("../data/unweightedDistDF.RDS").  Duplicate distance values will need to be removed from the unweighted data frame before proceeding.
+
+Both objects will be read-in here and modified as needed.
+
+## Load, Modify Data Frame
+
+```{r metadataStool}
+# phyloseq object containing necessary metadata
+if (!exists("physeqStool")) {
+  physeqStool <- readRDS("../data/physeqOjects/physeqStool.RDS")
+}
+# extract the metadata into a data frame
+metadataStool <- data.frame(sample_data(physeqStool))
+```
+
+### Add Weight Gain Category for Mothers
+
+Using the ACOG "Weight Gain During Pregnancy" guidelines for twin pregnancy gestational weight gain.  See https://www.acog.org/Clinical-Guidance-and-Publications/Committee-Opinions/Committee-on-Obstetric-Practice/Weight-Gain-During-Pregnancy?IsMobileSet=false.
+
+```{r weightGainList}
+weightGainList <- list(normal = list(min = 16.8, max = 24.5),
+                       overweight = list(min = 14.1, max = 22.7),
+                       obese = list(min = 11.3, max = 19.1))
+```
+
+```{r metadataMothers}
+# extract mother values & calculate gestational weight gain
+metadataMothers <- metadataStool %>%
+  rownames_to_column(var = "SampleName") %>%
+  filter(InfantMother == "mother") %>%
+  select(SampleName, Family_Group, PPWeightKG, DlvryWeightKG, PPBMICat) %>%
+  mutate(GestWeightGainKG = DlvryWeightKG - PPWeightKG) %>%
+  column_to_rownames(var = "Family_Group")
+
+metadataMothers$PPBMICat <- as.character(metadataMothers$PPBMICat)
+
+
+# Make empty lut to hold family group and gestational weight gain category
+gainCat_lut <- vector(mode = "character", length = nrow(metadataMothers))
+names(gainCat_lut) <- row.names(metadataMothers)
+
+# Loop over data frame and build new column
+for (i in 1:length(gainCat_lut)) {
+  gainCategory <- NULL
+  currentMotherGroup <- names(gainCat_lut)[i]
+  currentMotherBMICat <- metadataMothers[currentMotherGroup, "PPBMICat"]
+  currentMotherGain <- metadataMothers[currentMotherGroup, "GestWeightGainKG"]
+  
+  if (currentMotherGain < weightGainList[[currentMotherBMICat]][["min"]]) {
+    gainCategory <- "under"
+  } else if (currentMotherGain > weightGainList[[currentMotherBMICat]][["max"]]) {
+    gainCategory <- "over"
+  } else {
+    gainCategory <- "normal"
+  }
+  
+  gainCat_lut[[currentMotherGroup]] <- gainCategory
+  
+}
+
+# Now use the gainCat_lut to append the gestational weight gain category back 
+#   to metadataStool
+metadataStool$Family_Group <- as.character(metadataStool$Family_Group)
+metadataStool <- metadataStool %>%
+  rownames_to_column() %>%
+  mutate("GestGainCat" = gainCat_lut[Family_Group]) %>%
+  column_to_rownames()
+```
+
+```{r save-metadata-with-gainCat, eval=FALSE}
+saveRDS(metadataStool, file = "../data/metadata/metadataStool_withGainCat.RDS")
+```
+
+```{r metadataShort}
+metadataShort <- metadataStool %>% 
+  rownames_to_column(var = "Sample") %>%
+  select(Sample, InfantMother, Zygosity, 
+         DeliveryRoute, FeedingType, DeliverySite, 
+         Race, PPBMICat, GestGainCat) %>%
+  mutate_all(as.character) %>% # change everything to character from factor
+  column_to_rownames(var = "Sample") 
+
+# change all values of "none" to NA
+metadataShort[metadataShort == "none"] <- NA
+```
+
+```{r weightedDistDFNoDupes}
+# weighted pair-wise df containing all samples
+if (!exists("weightedDistDFNoDupes")) {
+  weightedDistDFNoDupes <- readRDS("../data/weightedDistDFNoDupes.RDS")
+}
+# Change "Var1_Type" and "Var2_Type" to "Var1_InfantMother" and "Var2_InfantMother"
+data.table::setnames(x = weightedDistDFNoDupes,
+                     old = c("Var1_Type", "Var2_Type"),
+                     new = c("Var1_InfantMother", "Var2_InfantMother"))
+
+```
+
+```{r unweightedDistDFNoDupes}
+if (!exists("unweightedDistDF")) {
+  unweightedDistDF <- readRDS("../data/unweightedDistDF.RDS")
+}
+
+unweightedDistDFNoDupes <- unweightedDistDF[!duplicated(unweightedDistDF
+                                                        ["UniFrac_Distance"]), ]
+
+data.table::setnames(x = unweightedDistDFNoDupes,
+                     old = c("Var1_Type", "Var2_Type"),
+                     new = c("Var1_InfantMother", "Var2_InfantMother"))
+
+# Add category columns 
+unweightedDistDFNoDupes <- unweightedDistDFNoDupes %>%
+  mutate(category = case_when(Var1_InfantMother == "infant" & 
+                                Var2_InfantMother == "infant" ~ "Within Infants",
+                              Var1_InfantMother == "mother" & 
+                                Var2_InfantMother == "mother" ~ "Within Mothers",
+                              TRUE ~ "Infants vs Mothers")) # if ELSE is TRUE?
+```
+
+Add the metadata to the large data frames.  Because each row represents a pair-wise comparison, each metadata variable will have two columns (for example, Var1_Zygosity, Var2_Zygosity).
+
+```{r add-metadata-to-distanceDF}
+columnNames <- c("Var1", "Var2")
+metaVars <- c("Zygosity", "DeliveryRoute", "FeedingType", "DeliverySite",
+              "Race", "PPBMICat", "GestGainCat")
+
+allSamplesWeightedDF <- weightedDistDFNoDupes
+allSamplesUnweightedDF <- unweightedDistDFNoDupes
+
+AddMetadata <- function(df) {
+  for (variable in metaVars) {
+    for (col in columnNames) {
+      # generate the new column name
+      newColName <- paste(col, variable, sep = "_")
+      # get all the samples in the current column
+      samples <- df[[col]]
+      # loop over each - yes, I'm aware this could be optimized
+      for (i in 1:length(samples)) {
+        currentSample <- samples[i]
+        df[[newColName]][i] <- metadataShort[currentSample, variable]
+      }
+    }
+  }
+  return(df)
+}
+
+allSamplesWeightedDF <- AddMetadata(allSamplesWeightedDF)
+allSamplesUnweightedDF <- AddMetadata(allSamplesUnweightedDF)
+```
+
+"allSamples" contains all samples, related and not.  No duplicates. (table 1 Site - M/I)
+
+```{r write-out-allSamplesDF, eval=FALSE}
+saveRDS(allSamplesWeightedDF, file = "../data/allSamplesWeightedDF.RDS")
+saveRDS(allSamplesUnweightedDF, file = "../data/allSamplesUnweightedDF.RDS")
+```
+
+Separate "allSamples" into several smaller ones:
+  * mother and infant (related only) - motherInfPairedDF (table 2)
+  * all infant samples (related or not) - "allInfantsDF" (table 1, Zyg, Route, Feed)
+
+```{r separate-dfs}
+# weighted
+motherInfPairedWeightedDF <- allSamplesWeightedDF %>%
+  filter(Pair_Relation == "related" &
+         category == "Infants vs Mothers")
+allInfantsWeightedDF <- allSamplesWeightedDF %>%
+  filter(category == "Within Infants")
+
+# unweighted
+motherInfPairedUnweightedDF <- allSamplesUnweightedDF %>%
+  filter(Pair_Relation == "related" &
+         category == "Infants vs Mothers")
+allInfantsUnweightedDF <- allSamplesUnweightedDF %>%
+  filter(category == "Within Infants")
+```
+
+Function definition and required data that can be used for easily calculating p-values across different data frames on different metadata variables:
+
+```{r function-definitions}
+
+#--------------------------------#
+# Data required for CalculatePValues()
+#   Generate a named vector that will let us lookup the categories for a given
+#   metadata variable.
+
+# Get the metadata variables from the metadata data frame
+allMetadataVars <- colnames(metadataShort)
+
+# Create list for final output
+variableCategories <- vector(mode = "list", length = length(allMetadataVars))
+
+# Populate the list
+for (i in 1:length(allMetadataVars)) {
+  currentMetaVar <- allMetadataVars[i]
+  currentCategories <- unique(metadataShort[, currentMetaVar])
+  # remove any NA values:
+  finalCategories <- currentCategories[!(is.na(currentCategories))]
+  # fill list
+  variableCategories[[i]] <- finalCategories
+  names(variableCategories)[i] <- currentMetaVar
+}
+
+#--------------------------------#
+# Function that will be called inside of CalculatePValues().
+#   Function that helps filter a data frame in a dplyr-inspired manner
+#   but bypasses the pitfalls of non-standard evaluation.
+
+GetDistValues <- function(df, category, colName1, colName2, distance) {
+  # Filter the rows
+  filteredDF <- df[df[, colName1] == category & df[, colName2] == category, ]
+  # Get just the distance values as a numeric vector
+  values <- filteredDF[, distance]
+}
+
+#--------------------------------#
+
+CalculatePValues <- function(variablesVec, df, distance = "WUniFrac_Distance") {
+  # create an empty named vector that will be returned
+  pvalueVector <- vector(length = length(variablesVec))
+  metadataVariables <- variablesVec
+  
+  for (i in 1:length(metadataVariables)) {
+    
+    currentVariable <- metadataVariables[i]
+    
+    currentColName1 <- paste0("Var1_", currentVariable)
+    currentColName2 <- paste0("Var2_", currentVariable)
+    
+    # Get categories for the given metadata variable
+    categories <- variableCategories[[currentVariable]]
+    
+    values <- map(.x = categories,
+                  .f = GetDistValues,
+                  df = df,
+                  colName1 = currentColName1,
+                  colName2 = currentColName2,
+                  distance = distance)
+    
+    # Run wilcox.test if 2 variables or kruskal.test if 3 variables
+    statTest <- NULL
+    pvalue <- NULL
+    
+    if (length(categories) == 2) {
+      statTest <- wilcox.test(x = unlist(values[1]), y = unlist(values[2]))
+      pvalue <- statTest$p.value
+    } else {
+      statTest <- kruskal.test(values)
+      pvalue <- statTest$p.value
+    } 
+    
+    pvalueVector[i] <- pvalue
+    names(pvalueVector)[i] <- currentVariable
+  
+  }
+  
+  return(pvalueVector)
+  
+}
+
+#--------------------------------#
+
+DoDunnTest <- function(metadataVar, df, distance) {
+  dunnVariable <- metadataVar
+  currentColName1 <- paste0("Var1_", dunnVariable)
+  currentColName2 <- paste0("Var2_", dunnVariable)
+  # for given metadata variable, get the categories
+  currentCategories <- variableCategories[[dunnVariable]]
+  # get distance values for each category
+  distValues <- map(.x = currentCategories,
+                    .f = GetDistValues,
+                    df = df,
+                    colName1 = currentColName1, 
+                    colName2 = currentColName2,
+                    distance = distance)
+  names(distValues) <- currentCategories
+  # generate data frames that will be rbind together
+  frameList <- vector("list", length = length(currentCategories))
+  for(i in 1:length(distValues)) {
+    frame <- data.frame("values" = distValues[[i]],
+                        "type" = (names(distValues)[i]))
+    frameList[[i]] <- frame
+}
+
+  bigDF <- Reduce(f = function(df1, df2) {rbind(x = df1, y = df2)},
+                  x = frameList)
+  
+  test <- dunnTest(values ~ type, bigDF)
+  results <- test$res
+}
+
+```
+
+## Table 1
+
+### Infants Only
+
+Metadata variables:
+  * Zygosity
+  * DeliveryRoute
+  * FeedingType
+
+df: "allInfants*weightedDF"
+
+```{r allInfants}
+t1InfantVars <- c("Zygosity", "FeedingType", "DeliveryRoute")
+
+t1Infants <- pmap(.l = list(df = list(weighted = allInfantsWeightedDF,
+                                      unweighted = allInfantsUnweightedDF),
+                            distance = list(weighted = "WUniFrac_Distance",
+                                            unweighted = "UniFrac_Distance")),
+                  .f = CalculatePValues,
+                  variablesVec = t1InfantVars)
+t1Infants
+```
+
+By unweighted UniFrac, FeedingType and DeliveryRoute are significant.
+By weighted UniFrac, Zygosity, FeedingType, and DeliveryRoute are significant.
+
+Now we'll do a post-hoc test to see where the significance falls for 3-category variables (FeedingType):
+
+```{r t1-feed-dunn}
+t1FeedingDunnWeighted <- DoDunnTest("FeedingType", allInfantsWeightedDF,
+                                  distance = "WUniFrac_Distance")
+t1FeedingDunnWeighted
+
+t1FeedingDunnUnweighted <- DoDunnTest("FeedingType", allInfantsUnweightedDF, 
+                                    distance = "UniFrac_Distance")
+t1FeedingDunnUnweighted
+```
+
+### All Samples
+
+Metadata variables:
+  * DeliverySite
+  * Race
+  * PPBMICat
+  * GestGainCat
+  
+df:  "allSamples*weightedDF"
+
+```{r allSamples}
+t1AllSampVars <- c("DeliverySite", "Race", "PPBMICat", "GestGainCat")
+
+t1AllSamples <- pmap(.l = list(df = list(weighted = allSamplesWeightedDF,
+                                         unweighted = allSamplesUnweightedDF),
+                            distance = list(weighted = "WUniFrac_Distance",
+                                            unweighted = "UniFrac_Distance")),
+                  .f = CalculatePValues,
+                  variablesVec = t1AllSampVars)
+
+t1AllSamples
+```
+
+By weighted UniFrac, DeliverySite is significant.
+By unweighted UniFrac, PPBMICat is significant.
+
+Well do the post-hoc test for PPBMICat and GestGainCat using the unweighted UniFrac distance measure:
+```{r t1PPBMIDunn}
+t1PPBMIDunnUnweighted <- DoDunnTest("PPBMICat", allSamplesUnweightedDF,
+                                    distance = "UniFrac_Distance")
+t1PPBMIDunnUnweighted
+
+t1GestGainCat <- DoDunnTest("GestGainCat", allSamplesUnweightedDF,
+                            distance = "UniFrac_Distance")
+t1GestGainCat
+```
+
+## Table 2
+
+### Paired Mother Infants
+
+df: "motherInfPaired*weightedDF"
+
+In the original data set, mothers don't have a category for Zygosity, Delivery Route or Feeding Type, since those are inherent for the infants but not mothers.  However to test the difference between infants of different categories and their moms, we'll have to propogate the value of the infant to the mom for each pairwise comparison.
+
+```{r mutate-mom-categories}
+# mother sample is always Var2
+motherInfPairedUnweightedDF <- motherInfPairedUnweightedDF %>%
+  mutate(Var2_Zygosity = Var1_Zygosity,
+         Var2_DeliveryRoute = Var1_DeliveryRoute,
+         Var2_FeedingType = Var1_FeedingType)
+
+motherInfPairedWeightedDF <- motherInfPairedWeightedDF %>%
+  mutate(Var2_Zygosity = Var1_Zygosity,
+         Var2_DeliveryRoute = Var1_DeliveryRoute,
+         Var2_FeedingType = Var1_FeedingType)
+```
+
+```{r pairedMomInf}
+t2SampVars <- c("Zygosity", "FeedingType","DeliveryRoute", 
+                "DeliverySite", "Race", "PPBMICat", "GestGainCat")
+
+t2PairedSamples <- pmap(.l = list(df = list(weighted = motherInfPairedWeightedDF,
+                                            unweighted = motherInfPairedUnweightedDF),
+                            distance = list(weighted = "WUniFrac_Distance",
+                                            unweighted = "UniFrac_Distance")),
+                  .f = CalculatePValues,
+                  variablesVec = t2SampVars)
+
+t2PairedSamples
+
+```
+
+For the weighted measure measure when looking at paired mother/infant distances, none of the metadata variables come up as significant.  For the unweighted measure, only FeedingType shows a significant difference.
+
+Post-hoc test for FeedingType using the unweighted UniFrac distance:
+```{r}
+t2FeedingDunnUnweighted <- DoDunnTest("FeedingType", motherInfPairedUnweightedDF,
+                                      distance = "UniFrac_Distance")
+t2FeedingDunnUnweighted
+```
+
+## Table 1 and Table 2 - Mother or Infant
+
+For table 1, we want to compare the distances between all infants against the distances of all mothers.
+
+Weighted UniFrac:
+```{r t1-mom-to-inf-weighted}
+allMomToMomWeighted <- allSamplesWeightedDF %>%
+  filter(category == "Within Mothers") %>%
+  pull("WUniFrac_Distance")
+
+allInfToInfWeighted <- allSamplesWeightedDF %>%
+  filter(category == "Within Infants") %>%
+  pull("WUniFrac_Distance")
+
+t1MomVsInfWeightedTest <- wilcox.test(x = allMomToMomWeighted, 
+                                      y = allInfToInfWeighted)
+t1MomVsInfWeightedTest$p.value
+```
+
+Unweighted UniFrac:
+```{r t1-mom-to-inf-unweighted}
+allMomToMomUnweighted <- allSamplesUnweightedDF %>%
+  filter(category == "Within Mothers") %>%
+  pull("UniFrac_Distance")
+
+allInfToInfUnweighted <- allSamplesUnweightedDF %>%
+  filter(category == "Within Infants") %>%
+  pull("UniFrac_Distance")
+
+t1MomVsInfUnweightedTest <- wilcox.test(x = allMomToMomUnweighted, y = allInfToInfUnweighted)
+t1MomVsInfUnweightedTest$p.value
+```
+
+Both weighted and unweighted measures return very significant p-values when comparing the distances between all mothers to the distances between all infants.
+
+For table 2, we want to compare the distances between moms and their related infants against unrelated moms and infants.
+
+```{r t2-mom-to-inf-weighted}
+relatedMomToInfWeighted <- allSamplesWeightedDF %>%
+  filter(category == "Infants vs Mothers" &
+         Pair_Relation == "related") %>%
+  pull("WUniFrac_Distance")
+
+unrelatedMomToInfWeighted <- allSamplesWeightedDF %>%
+  filter(category == "Infants vs Mothers" &
+         Pair_Relation == "unrelated") %>%
+  pull("WUniFrac_Distance")
+
+t2MomToInfWeightedTest <- wilcox.test(x = relatedMomToInfWeighted, 
+                                      y = unrelatedMomToInfWeighted)
+t2MomToInfWeightedTest$p.value
+```
+
+```{r t2-mom-to-inf-unweighted}
+relatedMomToInfUnweighted <- allSamplesUnweightedDF %>%
+  filter(category == "Infants vs Mothers" &
+         Pair_Relation == "related") %>%
+  pull("UniFrac_Distance")
+
+unrelatedMomToInfUnweighted <- allSamplesUnweightedDF %>%
+  filter(category == "Infants vs Mothers" &
+         Pair_Relation == "unrelated") %>%
+  pull("UniFrac_Distance")
+
+t2MomToInfUnweightedTest <- wilcox.test(x = relatedMomToInfUnweighted,
+                                        y = unrelatedMomToInfUnweighted)
+t2MomToInfUnweightedTest$p.value
+```
+
+Neither distance measure shows a significant difference between the pairwise distances of related moms/infants compared to unrelated moms/infants.
+
+## Additional - Related Infants Grouped by Zygosity
+
+Is the average distance between related infants significantly different when grouped by zygosity? 
+
+```{r related-infant-DFs}
+relatedInfantsUnweighted <- allInfantsUnweightedDF %>%
+  filter(Pair_Relation == "related")
+
+relatedInfantsWeighted <- allInfantsWeightedDF %>%
+  filter(Pair_Relation == "related")
+```
+
+```{r related-inf-zygosity}
+relInfZygosity <- pmap(.l = list(df = list(weighted = relatedInfantsWeighted,
+                                           unweighted = relatedInfantsUnweighted),
+                            distance = list(weighted = "WUniFrac_Distance",
+                                            unweighted = "UniFrac_Distance")),
+                  .f = CalculatePValues,
+                  variablesVec = "Zygosity")
+relInfZygosity
+```
+
+When just looking at pairwise distances of related infants grouped by zygosity, there's no significant difference by weighted or unweighted UniFrac.
+
+# What Affects the Percent Relative Abundance Shared with Mom?
+
+## Time difference between mom and infant sample?
+
+Here we want to investigate whether the time difference between a mother's sample and her baby's samlple correlated with the percent relative abundance the baby shares with mom
+
+```{r}
+infantPerspectiveRA <- readRDS(file = "../data/infantPerspectiveRA.RDS")
+
+#metadataStool <- data.frame(sample_data(physeqStool))
+
+# keep only the shared rows & add family group to infantPerspectiveRA
+infantPerspectiveRATrim <- infantPerspectiveRA %>%
+  filter(shared == TRUE) %>%
+  mutate(Family_Group = str_extract(sample, "^[:digit:]{1,2}"))
+infantPerspectiveRATrim$sample <- as.character(infantPerspectiveRATrim$sample)
+  
+# add collection time information for mom and infant
+# add column like "sample" to metadataStool
+metadataStoolExtra <- metadataStool %>%
+  mutate(sample = str_remove(Tarr_Subject_ID, "^C[0]{1,2}")) %>%
+  column_to_rownames(var = "sample")
+metadataStoolExtra$SampleCollectionTime <- as.character(metadataStoolExtra$SampleCollectionTime)
+
+infantPerspectiveRATrim <- infantPerspectiveRATrim %>%
+  mutate(infant_collection_time = metadataStoolExtra[sample, "SampleCollectionTime"],
+         mother_collection_time = metadataStoolExtra[Family_Group, "SampleCollectionTime"],
+         time_difference_seconds = abs(as.POSIXct(mother_collection_time) -
+                                       as.POSIXct(infant_collection_time)))
+```
+
+Does "percent" depend on "time_difference_seconds"?
+
+```{r linear-regression}
+regression <- lm(formula = percent ~ time_difference_seconds,
+                 data = infantPerspectiveRATrim)
+summary(regression)
+```
+
+```{r plot-regression, fig.width=9, fig.height=6}
+regressionPlot <- ggplot(infantPerspectiveRATrim,
+                         aes(x = time_difference_seconds,
+                             y = percent,
+                             label = sample)) +
+  geom_text_repel(size = 3)+
+  geom_point() +
+  geom_smooth(method = lm) +
+  theme_bw() +
+  ylab("Percent Shared with Mother") +
+  xlab("Time Difference in Sample Collection with Mother (seconds)") +
+  ggtitle("All Samples") +
+  theme(plot.title = element_text(hjust = 0.5))
+  
+regressionPlot
+```
+
+It doesn't look like a pattern here.
+
+```{r add time-difference-seconds}
+infantPerspectiveRATrim <- infantPerspectiveRATrim %>%
+  mutate(time_difference_days = time_difference_seconds/86400)
+
+infantPerspectiveData <- infantPerspectiveRATrim %>%
+  select(sample, percent, infant_collection_time, mother_collection_time,
+         time_difference_seconds)
+```
+
+```{r write-out-infantPerspectiveRATrim, eval=FALSE}
+write.table(infantPerspectiveData, file = "../documents/infantPerspectiveData.txt",
+            quote = FALSE, sep = "\t", row.names = FALSE)
+```
+
+Now we can generate a boxplot of infant samples compared to their mother segregated by whether their samples were taken within 7 days apart, or greater than 7 days apart.  I'll append this information to both motherInfPairedWeightedDF and motherInfantPairedUnweightedDF.
+
+```{r timeDiff_lut}
+# in infantPerspectiveRATrim, add category value for time difference
+infantPerspectiveRATrim <- mutate(infantPerspectiveRATrim,
+                                  time_difference_category = ifelse(time_difference_days > 7,
+                                                                    yes = "large",
+                                                                    no = "small"))
+
+timeDiff_lut <- as.character(infantPerspectiveRATrim$time_difference_category)
+names(timeDiff_lut) <- infantPerspectiveRATrim$sample
+```
+
+```{r spearmans-timeDiff}
+timeDiffSpearman <- cor.test(~ as.numeric(time_difference_seconds) + percent, 
+                        data = infantPerspectiveRATrim,
+                        method = "spearman")
+timeDiffSpearman
+```
+
+Weighted:
+
+```{r motherInfPairedWeightedDFExtra}
+# first add a sample column to motherInfPairedDF
+motherInfPairedWeightedDFExtra <- motherInfPairedWeightedDF %>%
+  mutate(sample = str_extract(Var1_ShortName, "[1-9]{1,2}\\.[:digit:]{1}"))
+
+# add categories to motherInfPairedDFExtra
+motherInfPairedWeightedDFExtra <- mutate(motherInfPairedWeightedDFExtra,
+                                         time_difference_category =
+                                           timeDiff_lut[sample])
+```
+
+```{r timeDiffWeightedBoxPlot, fig.width=9, fig.height=6}
+timeDiffWeightedBoxPlot <- MakeBoxPlot(motherInfPairedWeightedDFExtra,
+            xVar = "time_difference_category",
+            yVar = "WUniFrac_Distance",
+            label_y = "Weighted UniFrac Distance",
+            label_x = "Sample Time Difference",
+            statMethod = "wilcox.test")
+timeDiffWeightedBoxPlot
+```
+
+Unweighted:
+
+```{r motherInfPairedUnweightedDFExtra}
+motherInfPairedUnweightedDFExtra <- motherInfPairedUnweightedDF %>%
+  mutate(sample = str_extract(Var1_ShortName, "[1-9]{1,2}\\.[:digit:]{1}"))
+
+motherInfPairedUnweightedDFExtra <- mutate(motherInfPairedUnweightedDFExtra,
+                                         time_difference_category =
+                                           timeDiff_lut[sample])
+```
+
+```{r timeDiffUnweightedBoxPlot, fig.width=9, fig.height=6}
+timeDiffUnweightedBoxPlot <- MakeBoxPlot(motherInfPairedUnweightedDFExtra,
+            xVar = "time_difference_category",
+            yVar = "UniFrac_Distance",
+            label_y = "Unweighted UniFrac Distance",
+            label_x = "Sample Time Difference",
+            statMethod = "wilcox.test")
+timeDiffUnweightedBoxPlot
+```
+
+Time difference between mom and infant's sample doesn't seem to correlate with the percent relative abundance shared with mom.
+
+## Other Metadata that Might Have an Effect
+
+### Infant Age at Sample Collection
+
+Regress "TimeToCollection" for infants against their "percent" shared.
+
+```{r add-TimeToCollection}
+# Add TimeToCollection (from metadataStool) to infantPerspectiveRATrim
+# Add sample column to metadataStool:
+metadataStoolInfants <- metadataStool %>%
+  filter(InfantMother == "infant") %>%
+  mutate(sample = str_remove(Tarr_Subject_ID, "^C0{1,2}")) %>%
+  column_to_rownames(var = "sample")
+
+# Use the new sample column in metadataStoolInfants to pull in the TimeToCollection
+#   information to infantPerspectiveRATrim
+infantPerspectiveRATrim <- infantPerspectiveRATrim %>%
+  mutate(TimeToCollection = metadataStoolInfants[sample, "TimeToCollection"])
+```
+
+```{r linear-regression-age}
+ageRegression <- lm(formula = percent ~ TimeToCollection,
+                    data = infantPerspectiveRATrim)
+summary(ageRegression)
+```
+
+```{r spearmans-age}
+ageSpearman <- cor.test(~ TimeToCollection + percent, 
+                        data = infantPerspectiveRATrim,
+                        method = "spearman")
+ageSpearman
+```
+
+```{r plot-age-regression, fig.width=9, fig.height=6}
+ageRegressionPlot <- ggplot(infantPerspectiveRATrim,
+                         aes(x = TimeToCollection,
+                             y = percent,
+                             label = sample)) +
+  geom_text_repel(size = 3)+
+  geom_point() +
+  geom_smooth(method = lm) +
+  theme_bw() +
+  ylab("Percent Shared with Mother") +
+  xlab("Infant Age At Sample Collection (hours)") +
+  ggtitle("All Samples") +
+  theme(plot.title = element_text(hjust = 0.5))
+  
+ageRegressionPlot
+```
+
+Infant age at sample collection also does not seem to correlate with percent shared with mom.
+
+## Boxplots for Categorical Variables
+
+Series of boxplots looking at the average percent relative abundance shared with mother, separating infants by different metadata.
+
+To make things easier, let's bind information from infantPerspectiveRATrim back to metadataStoolInfants (percent, time_difference_seconds, time_difference_days, time_difference_category).
+
+```{r}
+infantTimeData <- infantPerspectiveRATrim %>%
+  select(sample, percent, time_difference_seconds, time_difference_days,
+         time_difference_category)
+
+metadataStoolInfants <- rownames_to_column(metadataStoolInfants,
+                                           var = "sample")
+
+metadataInfantsAll <- merge(infantTimeData, metadataStoolInfants,
+                            by = "sample", all = FALSE)
+```
+
+```{r percent-shared-boxplots, fig.width=9, fig.height=6}
+metadataList <- list(Zygosity = "Zygosity", FeedingType = "FeedingType",
+                     DeliveryRoute = "DeliveryRoute", Race = "Race",
+                     PPBMICat = "PPBMICat", GestGainCat = "GestGainCat")
+percentSharedBoxPlots <- pmap(.l = list(xVar = metadataList,
+                                        label_x = metadataList,
+                                        statMethod = list(Zygosity = "wilcox.test",
+                                                          FeedingType = "kruskal.test",
+                                                          DeliveryRoute = "wilcox.test",
+                                                          Race = "wilcox.test",
+                                                          PPBMICat = "kruskal.test",
+                                                          GestGainCat = "kruskal.test")),
+                              .f = MakeBoxPlot,
+                              df = metadataInfantsAll,
+                              yVar = "percent",
+                              label_y = "Percent Rel. Abd. Shared with Mother")
+percentSharedBoxPlots
+```
+
+Checking if these categories have different average ages or total read numbers.
+
+```{r}
+# add readsPerSample to metadataInfantsAll
+metadataInfantsAll <- metadataInfantsAll %>%
+  mutate(readsPerSample = metadataStoolExtra[sample, "readsPerSample"])
+
+
+MakeBoxPlot(metadataInfantsAll, xVar = "GestGainCat", yVar = "readsPerSample",
+            statMethod = "kruskal.test", label_y = "Reads Per Samples", 
+            label_x = "Mother's Gestational Weight Gain")
+
+MakeBoxPlot(metadataInfantsAll, xVar = "GestGainCat", yVar = "TimeToCollection",
+            label_y = "Infant Age at Sample Collection", statMethod = "kruskal.test")
+```
+
+***
+
+```{r session-info}
+Sys.Date()
+getwd()
+sessionInfo()
+```

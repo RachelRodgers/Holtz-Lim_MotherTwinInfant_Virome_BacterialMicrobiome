@@ -12,9 +12,10 @@ Analysis  consists of five scripts:
 ### Data Cleaning
 3. TwinMom16S_Pre-processing.Rmd
 
-### Analysis
-4. TwinMom16S_Analysis
-5. TwinMom16S_Shared_RelAbd_Plots.Rmd
+### Analyses
+4. TwinMom16S_Analysis (main bacterial analysis)
+5. TwinMom16S_Shared_RelAbd_Plots.Rmd (shared bacterial taxa analyses)
+6. TwinMom16S_Supplemental_Analysis.Rmd (supplemental bacterial analyses)
 
 ----
 ## Virome
