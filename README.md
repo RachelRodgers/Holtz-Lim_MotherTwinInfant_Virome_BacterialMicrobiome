@@ -3,7 +3,7 @@
 ----
 ## Bacterial Microbiome Analysis
 
-Analysis  consists of five scripts:
+Analysis  consists of six scripts:
 
 ### QC & Pre-processing
 1. TwinMom16S_Quality_ErrorRate_Checking.Rmd
